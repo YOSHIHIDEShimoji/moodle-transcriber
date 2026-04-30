@@ -4,6 +4,76 @@
 
 ---
 
+## 案3: 途中再開 `--resume`（優先度: 低・急がない）
+
+途中で中断した文字起こしを、前回の続きから再開する機能。
+
+### やりたいこと
+
+```bash
+# 前回 Ctrl+C で中断したファイルに続きを追記
+python main.py --moodle-url "moodle.example.com" --resume out/20260501/講義動画１.txt
+```
+
+### 実装メモ
+
+1. `--resume FILE` で既存の出力ファイルを指定
+2. ファイルの最後の `[HH:MM:SS]` タイムスタンプを読み取る
+3. その時刻以降の音声を録音・文字起こしして **追記** (`open("a")`)
+4. TXT ヘッダーの重複書き込みをスキップ
+
+#### タイムスタンプの読み取り (Python)
+
+```python
+import re
+from pathlib import Path
+
+def read_last_timestamp(path: Path) -> float:
+    text = path.read_text(encoding="utf-8")
+    matches = re.findall(r'\[(\d{2}):(\d{2}):(\d{2})\]', text)
+    if not matches:
+        return 0.0
+    h, m, s = matches[-1]
+    return int(h) * 3600 + int(m) * 60 + int(s)
+```
+
+5. `OutputWriter` に `append_mode=True` を追加して `open("a")` に切り替える
+6. `Transcriber` の `time_offset` に読み取った秒数を渡す
+
+### 注意点
+
+- SRT / VTT 形式では連番・タイムコードがずれるため TXT 形式のみ対応でよい
+- 録音を再開した瞬間から文字起こしが始まるため、前回終了から今回開始まで
+  の無音区間は飛ぶ（問題なし）
+
+---
+
+## 案4: 視聴進捗バー（優先度: 低）
+
+`get_viewing_percentage()` で取得した視聴状況%をターミナルにリアルタイム表示。
+
+### 表示イメージ
+
+```
+視聴状況  ████████░░░░░░░░  52%  [00:31:20 / 01:00:20]
+```
+
+### 実装メモ
+
+- 視聴状況%: 既存の `get_viewing_percentage()` をそのまま利用（30秒ごとポーリング）
+- 動画の長さ: `video.duration` を JS で取得（コンソール例: `duration=3620.7` 秒）
+- 現在位置: `video.currentTime` を JS で取得
+- `\r` で同じ行を上書きするシンプルな実装で十分
+
+```python
+bar_len = 16
+filled = int(bar_len * pct / 100)
+bar = "█" * filled + "░" * (bar_len - filled)
+print(f"\r視聴状況  {bar}  {pct}%", end="", flush=True)
+```
+
+---
+
 ## 案1: GUI アプリ（優先度: 低・急がない）
 
 ターミナルを使わずに操作できる macOS ネイティブ GUI アプリ。

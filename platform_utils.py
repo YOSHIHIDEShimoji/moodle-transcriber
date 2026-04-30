@@ -62,9 +62,10 @@ def setup_audio_for_capture() -> bool:
 
 def get_moodle_page_info(url_pattern: str, browser: str = "chrome") -> tuple[str | None, str | None]:
     """
-    Chrome の既存タブから h1 テキストと URL を取得。
-    AppleScript + JS で DOM を読むだけ → サーバーへのリクエストなし。
-    Returns: (h1_text, page_url)
+    Chrome の既存タブから講義タイトルと URL を取得。
+    AppleScript の `title of t` プロパティを使う → JS 実行・フレームコンテキスト問題なし。
+    Moodle の title 形式 "講義名 | コース名 | サイト名" から先頭部分を抽出する。
+    Returns: (title, page_url)
     """
     if SYSTEM != "Darwin":
         return None, None
@@ -72,34 +73,14 @@ def get_moodle_page_info(url_pattern: str, browser: str = "chrome") -> tuple[str
     if browser.lower() not in ("chrome", "arc"):
         return None, None
 
-    # window.top.document でメインフレームを指定 → SCORM iframe 内で実行されても正しく取得
-    # Moodle title 形式: "講義名 | コース名 | サイト名" → | で分割して先頭部分を使う
-    _JS = (
-        "(function(){"
-        "try{"
-        "var d=window.top.document;"
-        "var sels=['h1','.page-header-headings h1','.page-context-header h1'];"
-        "for(var i=0;i<sels.length;i++){"
-        "var el=d.querySelector(sels[i]);"
-        "if(el&&el.innerText&&el.innerText.trim())"
-        "{return el.innerText.trim().split('\\n')[0];}"
-        "}"
-        "var t=d.title.split('|')[0].trim();"
-        "return t||'lecture';"
-        "}catch(e){"
-        "return document.title.split('|')[0].trim()||'lecture';"
-        "}"
-        "})()"
-    )
-
     lines = [
         f'tell application "{app}"',
         "  repeat with w in windows",
         "    repeat with t in tabs of w",
         f'      if URL of t contains "{url_pattern}" then',
         "        set pageUrl to URL of t",
-        f'        set pageH1 to execute t javascript "{_JS}"',
-        '        return pageUrl & "\\n" & pageH1',
+        "        set pageTitle to title of t",
+        '        return pageUrl & "\\n" & pageTitle',
         "      end if",
         "    end repeat",
         "  end repeat",
@@ -113,10 +94,12 @@ def get_moodle_page_info(url_pattern: str, browser: str = "chrome") -> tuple[str
         return None, None
     parts = result.stdout.strip().split("\n", 1)
     page_url = parts[0] if parts else None
-    h1_text = parts[1].strip() if len(parts) > 1 else None
-    if not h1_text or h1_text == "missing value":
+    raw_title = parts[1].strip() if len(parts) > 1 else None
+    if not raw_title or raw_title == "missing value":
         return None, page_url
-    return h1_text, page_url
+    # "講義動画１ | 2026-@M1-IPE001 | ChibaUnivMoodle" → "講義動画１"
+    title = raw_title.split("|")[0].strip()
+    return (title or None), page_url
 
 
 def restore_audio_output(restore_to: str | None = None) -> None:

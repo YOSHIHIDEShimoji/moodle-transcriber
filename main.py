@@ -475,6 +475,11 @@ def run(args: argparse.Namespace) -> int:
                 if pct >= 0:
                     cur_s, total_s = get_video_time(args.moodle_url, args.keep_active)
                     print(_DIM(_fmt_progress(pct, cur_s, total_s)))
+                if pct >= 100:
+                    print(f"\n{_BGRN('視聴完了')} ({pct}%) — 自動終了")
+                    if keep_alive:
+                        keep_alive.stop()
+                    capture.stop()
     finally:
         writer.finalize()
         if routing_changed:

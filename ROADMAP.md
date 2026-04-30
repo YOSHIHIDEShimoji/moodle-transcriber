@@ -48,6 +48,61 @@ def read_last_timestamp(path: Path) -> float:
 
 ---
 
+## 案6: ファイル名入力タイムアウト（優先度: 低）
+
+録音停止後のファイル名入力で、1分間入力がなければデフォルトのファイル名で自動確定する。
+
+### 表示イメージ
+
+```
+現在のファイル名: out/20260501/講義動画１.txt
+変更する場合は新しい名前を入力 (Enter でそのまま): 
+自動確定まで: 47秒...
+```
+
+### 実装メモ
+
+現在の `_prompt_rename()` は `input()` でブロックする。タイムアウト付き `input` は
+macOS では `select` または `signal.alarm` で実装できる。
+
+```python
+import signal
+
+def _prompt_rename_with_timeout(path: Path, timeout: int = 60) -> Path:
+    print(f"\n現在のファイル名: {path}")
+
+    answered = threading.Event()
+    result: list[str] = [""]
+
+    def _reader():
+        try:
+            result[0] = input("変更する場合は新しい名前を入力 (Enter でそのまま): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            pass
+        finally:
+            answered.set()
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    for remaining in range(timeout, 0, -1):
+        if answered.wait(1):
+            break
+        print(f"\r自動確定まで: {remaining - 1}秒...  ", end="", flush=True)
+    else:
+        print()  # 改行
+
+    answered.set()  # タイムアウト時にスレッドを解放
+    # 以降は既存のリネーム処理
+    ...
+```
+
+- カウントダウンは `\r` で同じ行を上書き
+- `input()` スレッドが終わっていれば入力内容を使い、タイムアウトならデフォルト名
+- Windows では `signal.alarm` が使えないため `msvcrt.kbhit()` を使う
+
+---
+
 ## 案5: 無音スキップ（優先度: 低）
 
 録音した30秒セグメントの RMS（音量）が閾値以下の場合、Whisper に送らずスキップする機能。

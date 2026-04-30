@@ -159,6 +159,20 @@ def _prompt_rename(path: Path) -> Path:
     return new_path
 
 
+def _unique_path(path: Path) -> Path:
+    """既存ファイルと被る場合は _2, _3 ... を付けて一意にする。"""
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    parent = path.parent
+    i = 2
+    while True:
+        candidate = parent / f"{stem}_{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
 def _url_to_pattern(url: str) -> str:
     """Full URL からタブ検索に使う一意パターンを抽出する。"""
     parsed = urlparse(url)
@@ -204,14 +218,14 @@ def _process_one_url(
     fmt = OutputFormat(args.format)
     if args.output:
         base = args.output if total == 1 else f"{args.output}_{idx+1:02d}"
-        output_path = Path(f"{base}.{fmt.value}")
+        output_path = _unique_path(Path(f"{base}.{fmt.value}"))
         output_path.parent.mkdir(parents=True, exist_ok=True)
     else:
         now = datetime.now()
         out_dir = Path("out") / now.strftime("%Y%m%d")
         out_dir.mkdir(parents=True, exist_ok=True)
         filename = _sanitize_filename(page_title) if page_title else f"lecture_{now.strftime('%H%M%S')}"
-        output_path = out_dir / f"{filename}.{fmt.value}"
+        output_path = _unique_path(out_dir / f"{filename}.{fmt.value}")
 
     info_rows: list[tuple[str, str]] = []
     if page_title:

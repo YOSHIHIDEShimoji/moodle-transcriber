@@ -235,6 +235,34 @@ def test_multi_url_utils() -> None:
 
 # ─── 8. WindowKeepAlive save_interval ────────────────────────────────────────
 
+def test_progress_bar() -> None:
+    print("\n[8] 進捗バー (_fmt_progress / get_video_time import)")
+    from main import _fmt_progress
+
+    # 50% / 30分00秒経過 / 60分00秒
+    s = _fmt_progress(50, 1800.0, 3600.0)
+    check("_fmt_progress 50%: バー半分", "██████████░░░░░░░░░░" in s, repr(s))
+    check("_fmt_progress 50%: 00:30:00", "00:30:00" in s, repr(s))
+    check("_fmt_progress 50%: 01:00:00", "01:00:00" in s, repr(s))
+
+    # 0%
+    s0 = _fmt_progress(0, 0.0, 3620.0)
+    check("_fmt_progress 0%: バー空", "░░░░░░░░░░░░░░░░░░░░" in s0, repr(s0))
+
+    # 100%
+    s100 = _fmt_progress(100, 3620.0, 3620.0)
+    check("_fmt_progress 100%: バー満", "████████████████████" in s100, repr(s100))
+
+    # get_video_time: 非macOS または Chrome 未起動では (-1, -1)
+    from platform_utils import get_video_time
+    import platform
+    if platform.system() != "Darwin":
+        cur, total = get_video_time("example.com")
+        check("get_video_time: 非macOS → (-1,-1)", (cur, total) == (-1.0, -1.0))
+    else:
+        check("get_video_time import (macOS)", True)
+
+
 def test_window_keep_alive_save_interval() -> None:
     print("\n[8] WindowKeepAlive save_interval")
     from platform_utils import WindowKeepAlive
@@ -292,6 +320,7 @@ if __name__ == "__main__":
     test_applescript()
     test_whisper()
     test_capture_segmentation()
+    test_progress_bar()
     test_multi_url_utils()
     test_window_keep_alive_save_interval()
     test_new_args()

@@ -48,29 +48,43 @@ def read_last_timestamp(path: Path) -> float:
 
 ---
 
-## 案4: 視聴進捗バー（優先度: 低）
+## 案5: 無音スキップ（優先度: 低）
 
-`get_viewing_percentage()` で取得した視聴状況%をターミナルにリアルタイム表示。
+録音した30秒セグメントの RMS（音量）が閾値以下の場合、Whisper に送らずスキップする機能。
 
-### 表示イメージ
+### メリット
 
-```
-視聴状況  ████████░░░░░░░░  52%  [00:31:20 / 01:00:20]
-```
+- 無音区間（スライド切替、間）をスキップして処理速度向上
+- Whisperの**幻覚**（無音に対して「ありがとうございました」などを生成する現象）を防ぐ
 
 ### 実装メモ
 
-- 視聴状況%: 既存の `get_viewing_percentage()` をそのまま利用（30秒ごとポーリング）
-- 動画の長さ: `video.duration` を JS で取得（コンソール例: `duration=3620.7` 秒）
-- 現在位置: `video.currentTime` を JS で取得
-- `\r` で同じ行を上書きするシンプルな実装で十分
-
 ```python
-bar_len = 16
-filled = int(bar_len * pct / 100)
-bar = "█" * filled + "░" * (bar_len - filled)
-print(f"\r視聴状況  {bar}  {pct}%", end="", flush=True)
+import numpy as np
+
+def is_silent(audio: np.ndarray, threshold: float = 0.002) -> bool:
+    return float(np.sqrt(np.mean(audio ** 2))) < threshold
 ```
+
+- `capture.py` のセグメント生成後、または `main.py` のループ内で呼ぶ
+- `--silence-threshold 0.002` フラグで閾値を調整可能にする
+- 閾値のデフォルト値は実測で調整が必要（小声の講師で 0.001〜0.005 程度）
+
+---
+
+## 案4: 視聴進捗バー（優先度: 低）✅ 実装済み
+
+`get_viewing_percentage()` で取得した視聴状況%をターミナルにリアルタイム表示。
+
+### 表示イメージ（実装済み）
+
+```
+  視聴 ██████████░░░░░░░░░░  50%  [00:30:00 / 01:00:20]
+```
+
+- 視聴状況%: `get_viewing_percentage()` を30秒ごとに取得
+- 現在位置・総尺: `get_video_time()` で `video.currentTime | video.duration` をJS取得
+- シングルURL・マルチURL両モードで表示
 
 ---
 

@@ -48,6 +48,15 @@ _PLAY_VIDEO_JS = (
     "})()"
 )
 
+_GET_VIDEO_TIME_JS = (
+    "(function(){"
+    "var v=document.querySelector('video');"
+    "if(!v){for(var i=0;i<frames.length;i++){try{v=frames[i].document.querySelector('video');if(v)break;}catch(e){}}}"
+    "if(v){return v.currentTime+'|'+v.duration;}"
+    "return '-1|-1';"
+    "})()"
+)
+
 
 def _find_multi_output_device() -> str | None:
     """SwitchAudioSource -a でデバイス一覧を取得し、Multi-Output Device 名を返す。"""
@@ -223,6 +232,16 @@ def get_viewing_percentage(url_pattern: str, browser: str = "chrome") -> int:
         return int(raw)
     except (ValueError, TypeError):
         return -1
+
+
+def get_video_time(url_pattern: str, browser: str = "chrome") -> tuple[float, float]:
+    """動画の (現在位置秒, 総尺秒) を返す。取得失敗時は (-1, -1)。"""
+    raw = _run_js_in_tab(_GET_VIDEO_TIME_JS, url_pattern, browser)
+    try:
+        cur, total = raw.split("|")
+        return float(cur), float(total)
+    except (ValueError, AttributeError):
+        return -1.0, -1.0
 
 
 def click_save_button(url_pattern: str, browser: str = "chrome") -> bool:

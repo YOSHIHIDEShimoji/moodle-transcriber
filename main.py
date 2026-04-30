@@ -17,6 +17,7 @@ from platform_utils import (
     WindowKeepAlive,
     click_save_button,
     get_moodle_page_info,
+    get_video_time,
     get_viewing_percentage,
     navigate_to_url,
     restore_audio_output,
@@ -43,6 +44,15 @@ _YLW  = lambda s: _c(s, "33")       # 黄
 _DIM  = lambda s: _c(s, "2")        # 暗め
 _BOLD = lambda s: _c(s, "1")        # 太字
 _BGRN = lambda s: _c(s, "1;32")     # 太字緑
+
+
+def _fmt_progress(pct: int, cur_s: float, total_s: float) -> str:
+    bar_len = 20
+    filled = int(bar_len * max(0, min(pct, 100)) / 100)
+    bar = "█" * filled + "░" * (bar_len - filled)
+    cur = _fmt_ts(cur_s) if cur_s >= 0 else "--:--:--"
+    tot = _fmt_ts(total_s) if total_s > 0 else "--:--:--"
+    return f"  視聴 {bar} {pct:3d}%  [{cur} / {tot}]"
 
 
 def _print_session_info(rows: list[tuple[str, str]]) -> None:
@@ -267,6 +277,9 @@ def _process_one_url(
                 print(f"{prefix}{r.text}")
                 writer.append(r)
             pct = get_viewing_percentage(url_pattern, browser)
+            if pct >= 0:
+                cur_s, total_s = get_video_time(url_pattern, browser)
+                print(_DIM(_fmt_progress(pct, cur_s, total_s)))
             if pct >= 100:
                 print(f"\n{_BGRN('視聴完了')} ({pct}%) — 次の URL へ")
                 capture.stop()
@@ -457,6 +470,11 @@ def run(args: argparse.Namespace) -> int:
                 prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
                 print(f"{prefix}{r.text}")
                 writer.append(r)
+            if args.moodle_url and args.keep_active:
+                pct = get_viewing_percentage(args.moodle_url, args.keep_active)
+                if pct >= 0:
+                    cur_s, total_s = get_video_time(args.moodle_url, args.keep_active)
+                    print(_DIM(_fmt_progress(pct, cur_s, total_s)))
     finally:
         writer.finalize()
         if routing_changed:

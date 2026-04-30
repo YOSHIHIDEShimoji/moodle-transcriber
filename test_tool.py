@@ -175,6 +175,110 @@ def test_capture_segmentation() -> None:
     check("AudioCapture: オーバーラップ保持", cap._buffer_size == 8000, f"buffer_size={cap._buffer_size}")
 
 
+# ─── 7. _url_to_pattern / _collect_urls / _unique_path ───────────────────────
+
+def test_multi_url_utils() -> None:
+    print("\n[7] 複数URL処理ユーティリティ (_url_to_pattern / _collect_urls / _unique_path)")
+    import argparse, os, tempfile
+    from pathlib import Path
+    from main import _url_to_pattern, _collect_urls, _unique_path
+
+    # _url_to_pattern: id= クエリパラメータを抽出
+    cases = [
+        ("https://moodle.example.com/mod/scorm/player.php?id=123", "id=123"),
+        ("https://moodle.example.com/mod/scorm/player.php?id=456&cm=789", "id=456"),
+        ("https://moodle.example.com/course/view.php", "moodle.example.com/course/view.php"),
+    ]
+    for url, expected in cases:
+        got = _url_to_pattern(url)
+        check(f"_url_to_pattern id={expected}", got == expected, f"got={got!r}")
+
+    # _collect_urls: --urls
+    args = argparse.Namespace(urls=["https://a.com", "https://b.com"], url_file=None)
+    check("_collect_urls --urls", _collect_urls(args) == ["https://a.com", "https://b.com"])
+
+    # _collect_urls: --url-file（空行はスキップ）
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write("https://c.com\nhttps://d.com\n  \n")
+        fname = f.name
+    try:
+        args2 = argparse.Namespace(urls=None, url_file=fname)
+        got2 = _collect_urls(args2)
+        check("_collect_urls --url-file", got2 == ["https://c.com", "https://d.com"], f"got={got2}")
+    finally:
+        os.unlink(fname)
+
+    # _collect_urls: 両方指定で結合
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write("https://e.com\n")
+        fname2 = f.name
+    try:
+        args3 = argparse.Namespace(urls=["https://a.com"], url_file=fname2)
+        got3 = _collect_urls(args3)
+        check("_collect_urls 両方指定で結合", got3 == ["https://a.com", "https://e.com"], f"got={got3}")
+    finally:
+        os.unlink(fname2)
+
+    # _unique_path: 重複なし
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p = Path(tmpdir) / "lecture.txt"
+        check("_unique_path: 重複なし", _unique_path(p) == p)
+
+        p.touch()
+        p2 = _unique_path(p)
+        check("_unique_path: 1件重複 → _2", p2.name == "lecture_2.txt", f"got={p2.name}")
+
+        p2.touch()
+        p3 = _unique_path(p)
+        check("_unique_path: 2件重複 → _3", p3.name == "lecture_3.txt", f"got={p3.name}")
+
+
+# ─── 8. WindowKeepAlive save_interval ────────────────────────────────────────
+
+def test_window_keep_alive_save_interval() -> None:
+    print("\n[8] WindowKeepAlive save_interval")
+    from platform_utils import WindowKeepAlive
+
+    ka = WindowKeepAlive("chrome", interval=20.0, url_pattern="example.com", save_interval=60.0)
+    check("save_interval 設定値", ka._save_interval == 60.0)
+    check("_last_save 初期値 0.0", ka._last_save == 0.0)
+
+    ka2 = WindowKeepAlive("chrome", save_interval=0.0)
+    check("save_interval=0 で無効", ka2._save_interval == 0.0)
+
+    # デフォルト値
+    ka3 = WindowKeepAlive("chrome")
+    check("save_interval デフォルト 60.0", ka3._save_interval == 60.0)
+
+
+# ─── 9. argparse: --timestamps / --urls / --url-file / --save-interval ───────
+
+def test_new_args() -> None:
+    print("\n[9] 新規引数 (--timestamps / --urls / --url-file / --save-interval)")
+    from main import build_parser
+
+    p = build_parser()
+
+    # --timestamps: デフォルト False
+    args = p.parse_args([])
+    check("--timestamps デフォルト False", args.timestamps is False)
+    args_ts = p.parse_args(["--timestamps"])
+    check("--timestamps 指定で True", args_ts.timestamps is True)
+
+    # --save-interval: デフォルト 60.0
+    check("--save-interval デフォルト 60.0", args.save_interval == 60.0)
+    args_si = p.parse_args(["--save-interval", "30"])
+    check("--save-interval=30 の解析", args_si.save_interval == 30.0)
+
+    # --urls
+    args_urls = p.parse_args(["--urls", "https://a.com", "https://b.com"])
+    check("--urls 複数値", args_urls.urls == ["https://a.com", "https://b.com"])
+
+    # --url-file
+    args_uf = p.parse_args(["--url-file", "urls.txt"])
+    check("--url-file 解析", args_uf.url_file == "urls.txt")
+
+
 # ─── main ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -188,6 +292,9 @@ if __name__ == "__main__":
     test_applescript()
     test_whisper()
     test_capture_segmentation()
+    test_multi_url_utils()
+    test_window_keep_alive_save_interval()
+    test_new_args()
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

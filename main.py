@@ -130,6 +130,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="音声出力をスピーカーに戻して終了 (--restore-to で対象デバイスを指定可)",
     )
+    p.add_argument(
+        "--timestamps",
+        action="store_true",
+        help="各行に [HH:MM:SS] タイムスタンプを付与（デフォルト: オフ）",
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="詳細ログを表示")
     return p
 
@@ -258,7 +263,8 @@ def _process_one_url(
                 print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜")
             results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
             for r in results:
-                print(f"{_DIM(f'[{_fmt_ts(r.start)}]')} {r.text}")
+                prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
+                print(f"{prefix}{r.text}")
                 writer.append(r)
             pct = get_viewing_percentage(url_pattern, browser)
             if pct >= 100:
@@ -448,7 +454,8 @@ def run(args: argparse.Namespace) -> int:
                 print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜")
             results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
             for r in results:
-                print(f"{_DIM(f'[{_fmt_ts(r.start)}]')} {r.text}")
+                prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
+                print(f"{prefix}{r.text}")
                 writer.append(r)
     finally:
         writer.finalize()

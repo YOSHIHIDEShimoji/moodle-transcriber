@@ -2,20 +2,26 @@
 
 import argparse
 import platform
+import re
 import signal
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
-
-import re
+from urllib.parse import parse_qs, urlparse
 
 from capture import create_capture, find_loopback_device, list_all_devices
 from output import OutputFormat, OutputWriter, _fmt_ts
 from platform_utils import (
     WindowKeepAlive,
+    click_save_button,
     get_moodle_page_info,
+    get_viewing_percentage,
+    navigate_to_url,
     restore_audio_output,
     setup_audio_for_capture,
+    trigger_video_play,
 )
 from transcriber import Transcriber
 
@@ -91,6 +97,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="JS再注入の間隔（秒）（デフォルト: 20）",
     )
     p.add_argument(
+        "--save-interval",
+        type=float,
+        default=60.0,
+        help="「視聴状況を保存」ボタンクリック間隔（秒）（デフォルト: 60、0 で無効）",
+    )
+    p.add_argument(
+        "--urls",
+        metavar="URL",
+        nargs="+",
+        help="複数 URL を順次処理（例: --urls URL1 URL2 URL3）",
+    )
+    p.add_argument(
+        "--url-file",
+        metavar="FILE",
+        help="URL を1行1件で記載したファイル（--urls と組み合わせ可）",
+    )
+    p.add_argument(
         "--no-auto-routing",
         action="store_true",
         help="音声出力の自動切替を無効にする（手動で設定済みの場合）",
@@ -136,6 +159,162 @@ def _prompt_rename(path: Path) -> Path:
     return new_path
 
 
+def _url_to_pattern(url: str) -> str:
+    """Full URL からタブ検索に使う一意パターンを抽出する。"""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    if "id" in qs:
+        return f"id={qs['id'][0]}"
+    return parsed.netloc + parsed.path
+
+
+def _collect_urls(args: argparse.Namespace) -> list[str]:
+    urls: list[str] = []
+    if args.urls:
+        urls.extend(args.urls)
+    if args.url_file:
+        p = Path(args.url_file)
+        if p.exists():
+            urls.extend(line.strip() for line in p.read_text().splitlines() if line.strip())
+    return urls
+
+
+def _process_one_url(
+    url: str,
+    idx: int,
+    total: int,
+    transcriber: Transcriber,
+    args: argparse.Namespace,
+    device_index: int | None,
+    device_name: str,
+    current: dict,
+    stop_event: threading.Event,
+) -> None:
+    browser = args.keep_active
+    url_pattern = _url_to_pattern(url)
+
+    print(f"\n{_BOLD(f'[{idx+1}/{total}]')} {_CYN(url)}")
+
+    navigate_to_url(url, browser)
+    print("  ページ読み込み中...")
+    time.sleep(6)
+
+    page_title, page_url = get_moodle_page_info(url_pattern, browser)
+
+    fmt = OutputFormat(args.format)
+    if args.output:
+        base = args.output if total == 1 else f"{args.output}_{idx+1:02d}"
+        output_path = Path(f"{base}.{fmt.value}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        now = datetime.now()
+        out_dir = Path("out") / now.strftime("%Y%m%d")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        filename = _sanitize_filename(page_title) if page_title else f"lecture_{now.strftime('%H%M%S')}"
+        output_path = out_dir / f"{filename}.{fmt.value}"
+
+    info_rows: list[tuple[str, str]] = []
+    if page_title:
+        info_rows.append(("ページ", _GRN(page_title)))
+    info_rows.append(("デバイス", _CYN(f"[{device_index}] {device_name}")))
+    info_rows.append(("出力", _CYN(str(output_path))))
+    _print_session_info(info_rows)
+
+    writer = OutputWriter(output_path, fmt, args.model, args.language,
+                          title=page_title, page_url=page_url or url)
+    capture = create_capture(device_index, args.segment_duration, args.overlap)
+    keep_alive = WindowKeepAlive(
+        browser, args.keep_interval,
+        url_pattern=url_pattern,
+        save_interval=args.save_interval,
+    )
+    current["keep_alive"] = keep_alive
+    current["capture"] = capture
+
+    print(f"\n{_BGRN('▶  録音開始')}  {_DIM('Ctrl+C で全停止')}\n")
+    capture.start()
+    keep_alive.start()
+    trigger_video_play(url_pattern, browser)
+
+    try:
+        for segment in capture.segments():
+            if stop_event.is_set():
+                break
+            if args.verbose:
+                print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜")
+            results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
+            for r in results:
+                print(f"{_DIM(f'[{_fmt_ts(r.start)}]')} {r.text}")
+                writer.append(r)
+            pct = get_viewing_percentage(url_pattern, browser)
+            if pct >= 100:
+                print(f"\n{_BGRN('視聴完了')} ({pct}%) — 次の URL へ")
+                capture.stop()
+    finally:
+        keep_alive.stop()
+        writer.finalize()
+
+    print(f"{_BGRN('保存完了')}: {_CYN(str(output_path))}")
+    current["keep_alive"] = None
+    current["capture"] = None
+
+
+def _run_batch(
+    urls: list[str],
+    args: argparse.Namespace,
+    device_index: int | None,
+    device_name: str,
+    routing_changed: bool,
+) -> int:
+    print(f"\n{_BOLD(f'{len(urls)} 件の講義を順次処理します')}")
+    print("  Whisperモデルを読み込み中...")
+
+    transcriber = Transcriber(
+        model_size=args.model,
+        language=args.language,
+        cpu_threads=args.cpu_threads,
+    )
+
+    stop_event = threading.Event()
+    current: dict = {"keep_alive": None, "capture": None}
+
+    def handle_sigint(sig, frame):
+        if not stop_event.is_set():
+            stop_event.set()
+            print("\n停止中... バッファを処理しています")
+            if current["keep_alive"]:
+                current["keep_alive"].stop()
+            if current["capture"]:
+                current["capture"].stop()
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    try:
+        for i, url in enumerate(urls):
+            if stop_event.is_set():
+                break
+            _process_one_url(url, i, len(urls), transcriber, args,
+                             device_index, device_name, current, stop_event)
+            if not stop_event.is_set() and i < len(urls) - 1:
+                print(f"\n  次の URL まで {_DIM('5秒待機...')}")
+                time.sleep(5)
+    finally:
+        if routing_changed:
+            restore_audio_output(restore_to=args.restore_to)
+
+    if not stop_event.is_set():
+        if SYSTEM == "Darwin":
+            import subprocess as _sp
+            _sp.run(
+                ["osascript", "-e",
+                 f'display notification "{len(urls)}件の講義を文字起こし完了" with title "moodle-transcriber"'],
+                capture_output=True,
+            )
+        print(f"\n{_BGRN('全講義の処理が完了しました')} ({len(urls)}件)")
+
+    return 0
+
+
 def run(args: argparse.Namespace) -> int:
     if args.list_devices:
         list_all_devices()
@@ -152,6 +331,11 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     if args.moodle_url and not args.keep_active:
+        args.keep_active = "chrome"
+
+    # 複数 URL モードの判定（--urls / --url-file）
+    urls = _collect_urls(args)
+    if urls and not args.keep_active:
         args.keep_active = "chrome"
 
     # 音声ルーティング自動切替（macOS + SwitchAudioSource がある場合）
@@ -173,6 +357,12 @@ def run(args: argparse.Namespace) -> int:
     else:
         device_index = None
         device_name = "WASAPI Loopback（自動検出）"
+
+    # 複数 URL モード
+    if urls:
+        return _run_batch(urls, args, device_index, device_name, routing_changed)
+
+    # ─── 以下、シングル URL モード（既存の動作） ─────────────────────────────
 
     # ページ情報取得（Chrome タブの DOM から読む、サーバーリクエストなし）
     page_title, page_url = None, None
@@ -214,7 +404,11 @@ def run(args: argparse.Namespace) -> int:
 
     keep_alive: WindowKeepAlive | None = None
     if args.keep_active:
-        keep_alive = WindowKeepAlive(args.keep_active, args.keep_interval, url_pattern=args.moodle_url)
+        keep_alive = WindowKeepAlive(
+            args.keep_active, args.keep_interval,
+            url_pattern=args.moodle_url,
+            save_interval=args.save_interval,
+        )
 
     shutdown_requested = False
 

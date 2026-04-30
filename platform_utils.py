@@ -4,6 +4,7 @@ import platform
 import shutil
 import subprocess
 import threading
+import time
 
 SYSTEM = platform.system()
 
@@ -17,6 +18,34 @@ _VISIBILITY_JS = (
     "Object.defineProperty(document,'hidden',{get:()=>false,configurable:true});"
     "document.dispatchEvent(new Event('visibilitychange'));"
     "}catch(e){}"
+)
+
+_SAVE_BTN_JS = (
+    "(function(){"
+    "var btn=document.querySelector('#save > input[type=button]');"
+    "if(btn){btn.click();return 'clicked';}"
+    "return 'not_found';"
+    "})()"
+)
+
+_GET_PCT_JS = (
+    "(function(){"
+    "var b=document.body.innerText;"
+    "var i=b.indexOf('視聴状況');"
+    "if(i<0)return '-1';"
+    "var s=b.substring(i,i+20);"
+    "var n=s.match(/(\\d+)%/);"
+    "return n?n[1]:'-1';"
+    "})()"
+)
+
+_PLAY_VIDEO_JS = (
+    "(function(){"
+    "var v=document.querySelector('video');"
+    "if(!v){for(var i=0;i<frames.length;i++){try{v=frames[i].document.querySelector('video');if(v)break;}catch(e){}}}"
+    "if(v){v.play();return 'playing';}"
+    "return 'no_video';"
+    "})()"
 )
 
 
@@ -147,6 +176,60 @@ _LINUX_CMDS = {
 }
 
 
+def _run_js_in_tab(js: str, url_pattern: str, browser: str = "chrome") -> str:
+    """指定 URL パターンのタブで JS を実行して結果文字列を返す。"""
+    if SYSTEM != "Darwin":
+        return ""
+    app = _MACOS_APPS.get(browser.lower(), browser)
+    lines = [
+        f'tell application "{app}"',
+        "  repeat with w in windows",
+        "    repeat with t in tabs of w",
+        f'      if URL of t contains "{url_pattern}" then',
+        f'        return execute t javascript "{js}"',
+        "      end if",
+        "    end repeat",
+        "  end repeat",
+        "end tell",
+    ]
+    result = subprocess.run(
+        ["osascript", "-e", "\n".join(lines)],
+        capture_output=True, text=True, timeout=10,
+    )
+    return result.stdout.strip()
+
+
+def navigate_to_url(url: str, browser: str = "chrome") -> None:
+    """Chrome のアクティブタブを指定 URL に遷移させる。"""
+    if SYSTEM != "Darwin":
+        return
+    app = _MACOS_APPS.get(browser.lower(), browser)
+    script = (
+        f'tell application "{app}" to '
+        f'set URL of active tab of front window to "{url}"'
+    )
+    subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+
+
+def trigger_video_play(url_pattern: str, browser: str = "chrome") -> bool:
+    """Moodle タブの動画再生を開始する。成功時 True。"""
+    return _run_js_in_tab(_PLAY_VIDEO_JS, url_pattern, browser) == "playing"
+
+
+def get_viewing_percentage(url_pattern: str, browser: str = "chrome") -> int:
+    """視聴状況 XX% を取得する。取得失敗時は -1 を返す。"""
+    raw = _run_js_in_tab(_GET_PCT_JS, url_pattern, browser)
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return -1
+
+
+def click_save_button(url_pattern: str, browser: str = "chrome") -> bool:
+    """「視聴状況を保存」ボタン (#save > input[type=button]) をクリックする。成功時 True。"""
+    return _run_js_in_tab(_SAVE_BTN_JS, url_pattern, browser) == "clicked"
+
+
 class WindowKeepAlive:
     """
     Moodleタブをアクティブに保つバックグラウンドスレッド。
@@ -159,10 +242,13 @@ class WindowKeepAlive:
         browser: str = "chrome",
         interval: float = 20.0,
         url_pattern: str | None = None,
+        save_interval: float = 60.0,
     ):
         self._browser = browser.lower()
         self._interval = interval
         self._url_pattern = url_pattern
+        self._save_interval = save_interval
+        self._last_save: float = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -170,7 +256,8 @@ class WindowKeepAlive:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         pat = f" (URL: {self._url_pattern})" if self._url_pattern else ""
-        print(f"ウィンドウキープアライブ: {self._browser}{pat} ({self._interval}秒ごと)")
+        save_info = f", 保存:{self._save_interval:.0f}秒毎" if self._save_interval > 0 else ""
+        print(f"ウィンドウキープアライブ: {self._browser}{pat} ({self._interval}秒ごと{save_info})")
 
     def stop(self) -> None:
         self._stop.set()
@@ -227,6 +314,12 @@ class WindowKeepAlive:
                 f'"{app}" then set frontmost of process "{app}" to true'
             )
         subprocess.run(["osascript", "-e", script], capture_output=True)
+
+        if self._url_pattern and self._save_interval > 0:
+            now = time.monotonic()
+            if now - self._last_save >= self._save_interval:
+                click_save_button(self._url_pattern, self._browser)
+                self._last_save = now
 
     def _tick_linux(self) -> None:
         if shutil.which("xdotool"):

@@ -151,6 +151,9 @@ def run(args: argparse.Namespace) -> int:
             print("エラー: brew install switchaudio-osx が必要です")
         return 0
 
+    if args.moodle_url and not args.keep_active:
+        args.keep_active = "chrome"
+
     # 音声ルーティング自動切替（macOS + SwitchAudioSource がある場合）
     routing_changed = False
     if not args.no_auto_routing:

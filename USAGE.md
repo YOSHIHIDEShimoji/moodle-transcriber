@@ -51,9 +51,10 @@ pip install -r requirements.txt
 ### Chrome で Moodle を開いてから起動
 
 ```bash
-python main.py --keep-active chrome --moodle-url "your-univ.moodle.com"
+python main.py --moodle-url "your-univ.moodle.com"
 ```
 
+- `--moodle-url` を指定すると `--keep-active chrome` が自動的に有効になる
 - スクリプト起動直後に Moodle タブに JS を注入 → 別タブ・別アプリに移動しても動画が止まらない
 - `your-univ.moodle.com` はMoodleのドメインの一部を指定（例: `moodle`, `lms.example.ac.jp`）
 - 音声は Multi-Output Device に切り替わる（スピーカーから聞こえる + BlackHole で録音）
@@ -73,24 +74,27 @@ python main.py --keep-active chrome --moodle-url "your-univ.moodle.com"
 ## コマンド例
 
 ```bash
-# 基本（Chrome, 自動ルーティング, large-v3 モデル）
-python main.py --keep-active chrome --moodle-url "moodle.example.com"
+# 基本（--moodle-url だけで Chrome keep-alive が自動有効、large-v3 モデル）
+python main.py --moodle-url "moodle.example.com"
 
 # モデルを small に変更（初回テスト用・高速）
-python main.py --keep-active chrome --moodle-url "moodle.example.com" --model small
+python main.py --moodle-url "moodle.example.com" --model small
 
 # SRT 字幕形式で出力
-python main.py --keep-active chrome --moodle-url "moodle.example.com" --format srt
+python main.py --moodle-url "moodle.example.com" --format srt
 
 # 出力ファイル名を直接指定（カレントディレクトリに保存）
-python main.py --keep-active chrome --moodle-url "moodle.example.com" --output 解剖学_第3回
+python main.py --moodle-url "moodle.example.com" --output 解剖学_第3回
 # → ./解剖学_第3回.txt に保存（out/YYYYMMDD/ は使わない）
 
 # 自動音声切替を使わない（すでに手動でMulti-Output Deviceに設定済みの場合）
-python main.py --keep-active chrome --moodle-url "moodle.example.com" --no-auto-routing
+python main.py --moodle-url "moodle.example.com" --no-auto-routing
 
 # 終了後にスピーカーに戻す（Multi-Output Deviceに戻らないよう指定）
-python main.py --keep-active chrome --moodle-url "moodle.example.com" --restore-to "MacBook Proのスピーカー"
+python main.py --moodle-url "moodle.example.com" --restore-to "MacBook Proのスピーカー"
+
+# Arc ブラウザを使う場合（デフォルトの chrome を上書き）
+python main.py --moodle-url "moodle.example.com" --keep-active arc
 
 # 利用可能なデバイス一覧を確認
 python main.py --list-devices
@@ -106,8 +110,8 @@ python main.py --reset-audio --restore-to "MacBook Proのスピーカー"
 
 | オプション | デフォルト | 説明 |
 |---|---|---|
-| `--keep-active BROWSER` | なし | Moodleタブを維持するブラウザ: `chrome` / `arc` / `safari` / `firefox` |
-| `--moodle-url URL_PATTERN` | なし | MoodleタブのURLパターン（例: `moodle.example.com`） |
+| `--keep-active BROWSER` | `--moodle-url` 指定時は `chrome` | Moodleタブを維持するブラウザ: `chrome` / `arc` / `safari` / `firefox` |
+| `--moodle-url URL_PATTERN` | なし | MoodleタブのURLパターン（例: `moodle.example.com`）。指定すると `--keep-active chrome` が自動有効 |
 | `--keep-interval 秒` | 20 | JS再注入の間隔（秒） |
 | `-m MODEL` | `large-v3` | Whisperモデル: `tiny` / `small` / `medium` / `large-v3` |
 | `-f FORMAT` | `txt` | 出力形式: `txt` / `srt` / `vtt` |
@@ -163,7 +167,7 @@ python main.py --reset-audio --restore-to "MacBook Proのスピーカー"
 
 ## keep-alive の仕組み
 
-`--keep-active chrome --moodle-url` を指定すると：
+`--moodle-url` を指定すると（`--keep-active` 省略時は `chrome` が自動選択）：
 
 1. スクリプト起動直後にAppleScriptでChromeの全タブを検索
 2. URLが `--moodle-url` のパターンに一致するタブを見つける
@@ -209,7 +213,7 @@ brew install switchaudio-osx
 これがないと自動音声切替が無効になるが、手動でMulti-Output Deviceに切り替えれば動作する。
 
 ### Moodle の動画が止まる
-1. `--keep-active chrome` を指定しているか確認
+1. `--moodle-url` を指定しているか確認（指定すると Chrome keep-alive が自動有効）
 2. `--moodle-url` にMoodleのドメインが正しく含まれているか確認
 3. Chrome の場合、AppleScript 権限が必要: システム設定 → プライバシーとセキュリティ → オートメーション → ターミナル → Google Chrome にチェック
 4. Chrome の場合、JS 実行権限が必要: Chrome → 表示 → 開発/管理 → Apple Events からの JavaScript を許可

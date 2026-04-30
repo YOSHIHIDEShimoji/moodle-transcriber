@@ -106,12 +106,59 @@ python main.py --reset-audio --restore-to "MacBook Proのスピーカー"
 
 ---
 
+## 複数 URL の順次処理
+
+複数の講義 URL を渡すと、1本ずつ自動で処理してくれる。
+
+### 使い方
+
+```bash
+# --urls に URL をスペース区切りで並べる
+python main.py --urls \
+  "https://moodle.example.com/mod/scorm/player.php?id=101" \
+  "https://moodle.example.com/mod/scorm/player.php?id=102" \
+  "https://moodle.example.com/mod/scorm/player.php?id=103"
+
+# URL をファイルで渡す（1行1URL）
+python main.py --url-file urls.txt
+
+# 両方の組み合わせも可能
+python main.py --urls "https://..." --url-file urls.txt
+```
+
+`urls.txt` の書き方:
+```
+https://moodle.example.com/mod/scorm/player.php?id=101
+https://moodle.example.com/mod/scorm/player.php?id=102
+https://moodle.example.com/mod/scorm/player.php?id=103
+```
+
+### 自動処理の流れ
+
+1. URL1 を Chrome で開く（自動遷移）
+2. 動画を自動再生
+3. 文字起こし開始
+4. 60秒ごとに「視聴状況を保存」ボタンを自動クリック
+5. 視聴状況が 100% になったら次の URL へ
+6. 全 URL 完了後に macOS 通知
+
+### 注意事項
+
+- **Chrome が前面にある状態で実行すること**（URL 遷移が Chrome のアクティブタブに対して行われる）
+- 動画再生中はブラウザを別タブに移動しても問題ない（JS 注入で視聴状況は維持される）
+- Ctrl+C で途中停止した場合、その時点までの文字起こしは保存される
+
+---
+
 ## オプション一覧
 
 | オプション | デフォルト | 説明 |
 |---|---|---|
-| `--keep-active BROWSER` | `--moodle-url` 指定時は `chrome` | Moodleタブを維持するブラウザ: `chrome` / `arc` / `safari` / `firefox` |
+| `--keep-active BROWSER` | `--moodle-url` / `--urls` 指定時は `chrome` | Moodleタブを維持するブラウザ: `chrome` / `arc` / `safari` / `firefox` |
 | `--moodle-url URL_PATTERN` | なし | MoodleタブのURLパターン（例: `moodle.example.com`）。指定すると `--keep-active chrome` が自動有効 |
+| `--urls URL [URL ...]` | なし | 複数 URL を順次処理（フル URL を渡す） |
+| `--url-file FILE` | なし | URL を1行1件で記載したファイル |
+| `--save-interval 秒` | 60 | 「視聴状況を保存」ボタンのクリック間隔（0 で無効） |
 | `--keep-interval 秒` | 20 | JS再注入の間隔（秒） |
 | `-m MODEL` | `large-v3` | Whisperモデル: `tiny` / `small` / `medium` / `large-v3` |
 | `-f FORMAT` | `txt` | 出力形式: `txt` / `srt` / `vtt` |

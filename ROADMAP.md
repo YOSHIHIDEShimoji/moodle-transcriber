@@ -130,11 +130,12 @@ for (let i = 0; i < frames.length; i++) {
 }
 ```
 
-セレクターが判明したら、1分ごとの自動クリック JS:
+確認済みセレクター: **`#save > input[type=button]`**
+
+1分ごとの自動クリック JS:
 ```javascript
-// 例: セレクターが '#save-btn' の場合
 (function(){
-  const btn = document.querySelector('#save-btn');  // ← セレクター要確認
+  const btn = document.querySelector('#save > input[type=button]');
   if (btn) { btn.click(); return 'clicked'; }
   return 'not_found';
 })()

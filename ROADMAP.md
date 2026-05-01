@@ -4,6 +4,42 @@
 
 ---
 
+## 案7: whisper.cpp への移行（優先度: 中・Apple Silicon なら効果大）
+
+現在は `faster-whisper`（CTranslate2 / CPU int8）を使用。
+Apple Silicon (M1〜M4) では **whisper.cpp + Metal** に切り替えると GPU が使われ、
+large-v3 モデルで **3〜5倍高速** になる可能性がある。
+
+### 実装方針
+
+- `feature/whisper-cpp` ブランチを切って `transcriber.py` だけを差し替える
+- 他のファイル（`main.py`, `capture.py`, `output.py` など）は変更不要
+- Python バインディングは [`pywhispercpp`](https://github.com/abdeladim-s/pywhispercpp) が有力候補
+
+### インターフェース互換性
+
+現在の `Transcriber` は `transcribe(audio: np.ndarray, time_offset: float)` を返す。
+`pywhispercpp` でも同じシグネチャに合わせて `TranscriptSegment` を生成すれば他に影響なし。
+
+### 速度比較（参考、M4 Pro / large-v3）
+
+| 実装 | 30秒セグメント処理時間 |
+|---|---|
+| faster-whisper (CPU int8) | ~6秒 |
+| whisper.cpp (Metal GPU) | ~1〜2秒（推定） |
+
+### 手順メモ
+
+```bash
+git checkout -b feature/whisper-cpp
+pip install pywhispercpp
+# transcriber.py を pywhispercpp ベースに書き換え
+# requirements.txt: faster-whisper → pywhispercpp
+# python test_tool.py で [5] Whisper テストを通す
+```
+
+---
+
 ## 案3: 途中再開 `--resume`（優先度: 低・急がない）
 
 途中で中断した文字起こしを、前回の続きから再開する機能。

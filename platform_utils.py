@@ -78,27 +78,32 @@ _GET_PCT_JS = (
 )
 
 _GET_PLAY_BTN_POS_JS = (
+    # SCORM iframe 内の <video> を再生させるには、クリック先が iframe の内側で
+    # ある必要がある（Chrome の autoplay policy: ユーザーアクティベーションは
+    # フレーム単位で伝播するため）。最大面積の iframe の中心座標を返すことで、
+    # 確実に iframe 内にクリックを当てる。iframe が無いページでは再生ボタン or
+    # ウィンドウ中心にフォールバックする。
     "(function(){"
     "var cH=window.outerHeight-window.innerHeight;"
-    "var sels=['.vjs-big-play-button','.vjs-play-control','.big-play-button','video'];"
-    "function findPos(doc,ox,oy){"
-    "for(var s=0;s<sels.length;s++){"
-    "try{var b=doc.querySelector(sels[s]);"
-    "if(b){var r=b.getBoundingClientRect();return [ox+r.left+r.width/2,oy+r.top+r.height/2];}}"
-    "catch(e){}}"
-    "return null;}"
-    "var p=findPos(document,0,0);"
-    "if(p)return Math.round(window.screenX+p[0])+','+Math.round(window.screenY+cH+p[1]);"
     "var ifs=document.querySelectorAll('iframe');"
+    "var best=null,bestArea=0;"
     "for(var i=0;i<ifs.length;i++){"
-    "try{"
-    "var ir=ifs[i].getBoundingClientRect();"
-    "var fd=ifs[i].contentDocument||ifs[i].contentWindow.document;"
-    "p=findPos(fd,ir.left,ir.top);"
-    "if(p)return Math.round(window.screenX+p[0])+','+Math.round(window.screenY+cH+p[1]);"
-    "if(ir.width>0&&ir.height>0)return Math.round(window.screenX+ir.left+ir.width/2)+','+Math.round(window.screenY+cH+ir.top+ir.height/2);"
-    "}catch(e){}}"
-    "return Math.round(window.screenX+window.innerWidth/2)+','+Math.round(window.screenY+cH+window.innerHeight/2);"
+    "try{var r=ifs[i].getBoundingClientRect();"
+    "var a=r.width*r.height;"
+    "if(a>bestArea&&r.width>100&&r.height>100){bestArea=a;best=r;}}"
+    "catch(e){}}"
+    "if(best){"
+    "return Math.round(window.screenX+best.left+best.width/2)+','+"
+    "Math.round(window.screenY+cH+best.top+best.height/2);}"
+    "var sels=['.vjs-big-play-button','.vjs-play-control','.big-play-button','video'];"
+    "for(var s=0;s<sels.length;s++){"
+    "try{var b=document.querySelector(sels[s]);"
+    "if(b){var br=b.getBoundingClientRect();"
+    "return Math.round(window.screenX+br.left+br.width/2)+','+"
+    "Math.round(window.screenY+cH+br.top+br.height/2);}}"
+    "catch(e){}}"
+    "return Math.round(window.screenX+window.innerWidth/2)+','+"
+    "Math.round(window.screenY+cH+window.innerHeight/2);"
     "})()"
 )
 
@@ -272,13 +277,18 @@ def _run_js_in_tab(js: str, url_pattern: str, browser: str = "chrome") -> str:
 
 
 def navigate_to_url(url: str, browser: str = "chrome") -> None:
-    """Chrome のアクティブタブを指定 URL に遷移させる。"""
+    """Chrome のアクティブタブを指定 URL に遷移させる。
+
+    後続の System Events click が Chrome に届くよう、URL 変更前に activate する。
+    """
     if SYSTEM != "Darwin":
         return
     app = _MACOS_APPS.get(browser.lower(), browser)
     script = (
-        f'tell application "{app}" to '
-        f'set URL of active tab of front window to "{url}"'
+        f'tell application "{app}"\n'
+        f'  activate\n'
+        f'  set URL of active tab of front window to "{url}"\n'
+        f'end tell'
     )
     subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
 

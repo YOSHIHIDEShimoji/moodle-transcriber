@@ -592,6 +592,46 @@ def test_process_one_url_navigate_and_buttons() -> None:
     check("current が後片付けされた", current["keep_alive"] is None and current["capture"] is None)
 
 
+def test_play_btn_pos_js_iframe_priority() -> None:
+    """#13: _GET_PLAY_BTN_POS_JS が iframe 中心を最優先で返すこと（autoplay policy対策）。
+
+    Node.js が利用可能な環境では実際に JS を評価して座標を検証する。
+    """
+    print("\n[15] #13 _GET_PLAY_BTN_POS_JS の iframe 中心優先")
+    from platform_utils import _GET_PLAY_BTN_POS_JS
+
+    # 必須: AppleScript 内に "..." で埋め込むためダブルクォート禁止
+    check("_GET_PLAY_BTN_POS_JS にダブルクォート無し",
+          '"' not in _GET_PLAY_BTN_POS_JS)
+
+    # iframe 中心を最優先する分岐があること
+    check("iframe を querySelectorAll で取得",
+          "querySelectorAll('iframe')" in _GET_PLAY_BTN_POS_JS)
+    check("最大面積の iframe を選ぶ",
+          "bestArea" in _GET_PLAY_BTN_POS_JS)
+
+    if shutil.which("node"):
+        # 同オリジン iframe 1つあるページをモック
+        node_script = f"""
+            global.window = {{outerHeight:900,innerHeight:800,innerWidth:1280,screenX:0,screenY:0}};
+            global.document = {{
+                querySelectorAll: () => [{{
+                    getBoundingClientRect: () => ({{left:200,top:150,width:1000,height:600}})
+                }}],
+                querySelector: () => null
+            }};
+            global.Math = Math;
+            console.log(new Function('return ' + {_GET_PLAY_BTN_POS_JS!r})());
+        """
+        result = subprocess.run(
+            ["node", "-e", node_script],
+            capture_output=True, text=True, timeout=5,
+        )
+        out = result.stdout.strip()
+        # 期待座標: x=screenX(0)+200+500=700, y=screenY(0)+cH(100)+150+300=550
+        check("Node評価: iframe中心 → 700,550", out == "700,550", f"got={out!r}")
+
+
 # ─── main ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -614,6 +654,7 @@ if __name__ == "__main__":
     test_run_batch_all_urls()
     test_run_batch_stop_event()
     test_process_one_url_navigate_and_buttons()
+    test_play_btn_pos_js_iframe_priority()
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

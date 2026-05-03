@@ -264,6 +264,30 @@ def test_progress_bar() -> None:
     else:
         check("get_video_time import (macOS)", True)
 
+    # #11: _print_progress が TTY なら \r で同行更新、非TTYなら改行付き
+    import io
+    from unittest.mock import patch
+    from main import _print_progress
+
+    # 非TTY: 改行付き出力
+    fake_stdout = io.StringIO()
+    fake_stdout.isatty = lambda: False
+    with patch("main.sys.stdout", fake_stdout):
+        _print_progress(50, 1800.0, 3600.0)
+    out = fake_stdout.getvalue()
+    check("_print_progress 非TTY: 改行で終わる", out.endswith("\n"), repr(out[-30:]))
+    check("_print_progress 非TTY: \\r を含まない", "\r" not in out, repr(out))
+
+    # TTY: \r + 行クリア、改行なし
+    fake_stdout2 = io.StringIO()
+    fake_stdout2.isatty = lambda: True
+    with patch("main.sys.stdout", fake_stdout2):
+        _print_progress(50, 1800.0, 3600.0)
+    out2 = fake_stdout2.getvalue()
+    check("_print_progress TTY: \\r で始まる", out2.startswith("\r"), repr(out2[:10]))
+    check("_print_progress TTY: \\033[K で行クリア", "\033[K" in out2, repr(out2[:10]))
+    check("_print_progress TTY: 改行で終わらない", not out2.endswith("\n"), repr(out2[-20:]))
+
 
 def test_window_keep_alive_save_interval() -> None:
     print("\n[8] WindowKeepAlive save_interval")

@@ -85,6 +85,21 @@ def _fmt_progress(pct: int, cur_s: float, total_s: float) -> str:
     return f"  視聴 {bar} {pct:3d}%  [{cur} / {tot}]"
 
 
+def _print_progress(pct: int, cur_s: float, total_s: float) -> None:
+    """進捗バーを表示する。TTY なら \\r で同じ行を上書き、非TTYなら改行付き。
+
+    ログファイル (logs/moodle-transcriber.log) には書き出さない（DEBUG ログの
+    pct/ended 値だけで十分なため、進捗バー文字列をログから除外する）。
+    """
+    line = _DIM(_fmt_progress(pct, cur_s, total_s))
+    if sys.stdout.isatty():
+        # \r で行頭に戻し、行末まで消去（ESC[K）してから書き直す
+        sys.stdout.write(f"\r\033[K{line}")
+        sys.stdout.flush()
+    else:
+        print(line)
+
+
 def _print_session_info(rows: list[tuple[str, str]]) -> None:
     """セッション情報をきれいに表示する。"""
     label_w = max(len(r[0]) for r in rows)
@@ -364,7 +379,7 @@ def _process_one_url(
             logger.debug("segment %d: pct=%d ended=%s", segment.segment_id, pct, ended)
             if pct >= 0:
                 cur_s, total_s = get_video_time(url_pattern, browser)
-                print(_DIM(_fmt_progress(pct, cur_s, total_s)))
+                _print_progress(pct, cur_s, total_s)
             if ended:
                 print(f"\n{_BGRN('視聴完了')} — 保存中...")
                 logger.info("video ended: pct=%d", pct)
@@ -436,7 +451,7 @@ def _keep_active_one_url(
             logger.debug("keep-active poll: pct=%d ended=%s", pct, ended)
             if pct >= 0:
                 cur_s, total_s = get_video_time(url_pattern, browser)
-                print(_DIM(_fmt_progress(pct, cur_s, total_s)))
+                _print_progress(pct, cur_s, total_s)
             if ended:
                 print(f"\n{_BGRN('視聴完了')} — 保存中...")
                 logger.info("keep-active video ended: pct=%d", pct)
@@ -685,7 +700,7 @@ def run(args: argparse.Namespace) -> int:
                 logger.debug("segment %d: pct=%d ended=%s", segment.segment_id, pct, ended)
                 if pct >= 0:
                     cur_s, total_s = get_video_time(url_pattern, args.keep_active)
-                    print(_DIM(_fmt_progress(pct, cur_s, total_s)))
+                    _print_progress(pct, cur_s, total_s)
                 if ended:
                     print(f"\n{_BGRN('視聴完了')} — 保存中...")
                     logger.info("single url video ended: pct=%d", pct)

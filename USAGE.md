@@ -313,3 +313,28 @@ python main.py  # WASAPI Loopback を自動検出
 | `large-v3` | 最高 | ~6秒 | **専門用語が多い講義（推奨）** |
 
 初回は `--model small` でテスト → 問題なければ `large-v3`（初回DL約1.5GB）。
+
+---
+
+## GUI モード（PySide6）
+
+ターミナルを使わずにウィンドウから操作したい場合は `main_gui.py` を起動する。
+
+```bash
+pip install pyside6
+python main_gui.py
+```
+
+**Basic セクション** — 最低限の必須項目:
+- Moodle URL リスト（複数追加可、`＋ 追加` / `− 削除`）
+- Model / Format / Output Folder
+- ▶ Start / ■ Stop
+
+**Advanced セクション**（折りたたみ） — 複雑な設定:
+- 文字起こしせず Chrome 自動再生のみ (`--no-transcribe`)
+- 文字起こしテキストを Log に表示 (`--print-transcript`)
+- タイムスタンプ付与 (`--timestamps`)
+- Browser / Save interval / Keep interval
+- 音声ルーティング自動切替の無効化 / Restore to
+
+進捗バーとログがウィンドウに表示され、視聴完了時はファイル名リネームダイアログがポップアップする（CLI と同等）。Stop ボタンは内部で SIGINT を送るため、CLI の Ctrl+C と同じ流れで安全停止する。

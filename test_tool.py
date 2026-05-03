@@ -692,6 +692,88 @@ def test_no_transcribe_requires_url() -> None:
     check("--no-transcribe + URL未指定 → rc=1", rc == 1)
 
 
+def test_main_hooks() -> None:
+    """#4: main.py の _progress_hook / _rename_hook で CLI 既定動作を差し替えられる。"""
+    print("\n[18] #4 main.py の hook 機構")
+    from pathlib import Path as _Path
+    import main as _m
+
+    # progress hook: hook がセットされていればそちらに委譲
+    captured: list[tuple[int, float, float]] = []
+    _m._progress_hook = lambda p, c, t: captured.append((p, c, t))
+    try:
+        _m._print_progress(42, 1234.5, 3600.0)
+    finally:
+        _m._progress_hook = None
+    check("_progress_hook 経由で受信", captured == [(42, 1234.5, 3600.0)],
+          f"got={captured}")
+
+    # rename hook: hook がセットされていれば input をスキップ
+    rename_calls: list[_Path] = []
+
+    def fake_rename(p: _Path) -> _Path:
+        rename_calls.append(p)
+        return p.parent / "renamed.txt"
+
+    _m._rename_hook = fake_rename
+    try:
+        result = _m._prompt_rename(_Path("out/20260504/orig.txt"))
+    finally:
+        _m._rename_hook = None
+    check("_rename_hook が呼ばれた", len(rename_calls) == 1)
+    check("_rename_hook の戻り値で置換", result.name == "renamed.txt", f"got={result}")
+
+
+def test_main_gui_smoke() -> None:
+    """#4: main_gui を import / MainWindow を offscreen で生成 / args 構築できる。"""
+    print("\n[19] #4 main_gui スモーク (offscreen)")
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        import main_gui  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        check("main_gui import", False, str(e))
+        return
+    check("main_gui import", True)
+
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(["test"])
+    try:
+        win = main_gui.MainWindow()
+    except Exception as e:  # noqa: BLE001
+        check("MainWindow 生成", False, str(e))
+        return
+    check("MainWindow 生成", True)
+
+    check("初期 URL 件数 0", win.url_list.count() == 0)
+    check("Start 有効・Stop 無効",
+          win.btn_start.isEnabled() and not win.btn_stop.isEnabled())
+
+    # URL 1件 + Output指定 → args 組み立て
+    win.url_input.setText("https://moodle.example.com/.../view.php?id=1")
+    win._add_url()
+    win.output_edit.setText("out_test")
+    win.cb_no_transcribe.setChecked(True)
+
+    args = win._build_args()
+    check("_build_args 戻り値あり", args is not None)
+    check("URL 単一なら args.moodle_url にセット",
+          args.moodle_url == "https://moodle.example.com/.../view.php?id=1",
+          f"moodle_url={args.moodle_url}")
+    check("URL 単一なら args.urls=None", args.urls is None)
+    check("--no-transcribe チェック反映", args.no_transcribe is True)
+    check("output 反映", args.output == "out_test")
+    check("model デフォルト large-v3", args.model == "large-v3")
+
+    # URL 2件 → urls にセット
+    win.url_input.setText("https://m.example.com/?id=2")
+    win._add_url()
+    args2 = win._build_args()
+    check("URL 複数なら args.urls にセット",
+          args2.urls is not None and len(args2.urls) == 2)
+    check("URL 複数なら moodle_url=None", args2.moodle_url is None)
+
+
 def test_play_btn_pos_js_iframe_priority() -> None:
     """#13: _GET_PLAY_BTN_POS_JS が iframe 中心を最優先で返すこと（autoplay policy対策）。
 
@@ -757,6 +839,8 @@ if __name__ == "__main__":
     test_play_btn_pos_js_iframe_priority()
     test_keep_active_only_mode()
     test_no_transcribe_requires_url()
+    test_main_hooks()
+    test_main_gui_smoke()
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

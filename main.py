@@ -85,12 +85,22 @@ def _fmt_progress(pct: int, cur_s: float, total_s: float) -> str:
     return f"  視聴 {bar} {pct:3d}%  [{cur} / {tot}]"
 
 
+# GUI から差し替え可能な hook（None なら CLI 既定動作）
+_progress_hook = None  # type: ignore[var-annotated]
+_rename_hook = None  # type: ignore[var-annotated]
+
+
 def _print_progress(pct: int, cur_s: float, total_s: float) -> None:
     """進捗バーを表示する。TTY なら \\r で同じ行を上書き、非TTYなら改行付き。
 
     ログファイル (logs/moodle-transcriber.log) には書き出さない（DEBUG ログの
     pct/ended 値だけで十分なため、進捗バー文字列をログから除外する）。
+
+    `_progress_hook` がセットされていれば CLI 出力をスキップしてそちらに委譲する。
     """
+    if _progress_hook is not None:
+        _progress_hook(pct, cur_s, total_s)
+        return
     line = _DIM(_fmt_progress(pct, cur_s, total_s))
     if sys.stdout.isatty():
         # \r で行頭に戻し、行末まで消去（ESC[K）してから書き直す
@@ -224,6 +234,9 @@ def _trigger_with_retry(url_pattern: str, browser: str, attempts: int = 5, inter
 
 
 def _prompt_rename(path: Path, timeout: int = 60) -> Path:
+    # GUI 経由のときは Qt ダイアログに委譲する
+    if _rename_hook is not None:
+        return _rename_hook(path)
     use_alarm = SYSTEM != "Windows" and hasattr(signal, "SIGALRM")
     print(f"\n現在のファイル名: {_CYN(str(path))}")
     print(f"変更する場合は新しい名前を編集 ({timeout}秒で自動確定): ", end="", flush=True)

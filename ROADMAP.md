@@ -2,9 +2,55 @@
 
 将来実装したい機能案。
 
+各案はGitHub Issueでも追跡: [area:moodle-transcriber](https://github.com/YOSHIHIDEShimoji/my-projects/issues?q=is%3Aissue+label%3Aarea%3Amoodle-transcriber)
+
 ---
 
-## 案7: whisper.cpp への移行（優先度: 中・Apple Silicon なら効果大）
+## 案11: リネームプロンプトのカウントダウン表示（優先度: 低・GUI アプリ化時に実装）(#10)
+
+現在の `_prompt_rename()` はカウントダウン（60, 59, 58...）を ANSI エスケープで入力行を上書きしていたため、
+ファイル名を入力できない問題があった。CLI では削除済み（SIGALRM でタイムアウトのみ）。
+GUI の TextField では残り秒数をラベル表示できるため、GUI アプリ化時に実装する。
+
+---
+
+## 案10: Chrome プロファイル自動検出（優先度: 低）(#7)
+
+- `~/Library/Application Support/Google Chrome/Local State` の JSON を読み、
+  `profile.info_cache.<profile_dir>.gaia_name` / `user_name`（メールアドレス相当）を取得
+- CLI: `--chrome-profile` に `"Profile 1"` の代わりにメールアドレスや名前で指定可能
+- `--list-chrome-profiles` で一覧を表示（例: `Profile 1 → taro@example.com`）
+
+---
+
+## 案9: GUI アプリ — 必須オプション最小化 + 設定プロファイル（優先度: 低・急がない）(#9)
+
+現在のCLIオプションは多く、初回利用のハードルが高い。
+
+### 方針
+
+- GUI 起動時に入力するのは Moodle URL（またはURLファイル）のみ
+- モデル・出力形式・デバイス設定などは「詳細設定」タブまたは設定ファイル（TOML/JSON）に分離
+- URLリストをアプリ内で追加・削除・並び替えできるリストビュー
+- 設定プロファイル（大学用・個人用など）の切り替え
+
+---
+
+## 案8: ファイル名入力欄のプリフィル（優先度: 低・GUI アプリ化時に実装）(#8)
+
+現在の案6（ファイル名タイムアウト入力）では、入力欄は空欄から始まる。
+GUI アプリ化（案1）の際に、テキストフィールドにページタイトルから生成したファイル名を
+初期値として入力済みにしておく。
+
+### CUI での試み・断念理由
+
+ターミナルの `input()` + `readline.set_startup_hook` でプリフィルは実現できるが、
+Delete キーを押すと readline の内部バッファに積まれた文字列が一括削除されてしまい、
+ユーザー体験が悪い。GUI の TextField では自然に実現できるため、CLI では不採用とした。
+
+---
+
+## 案7: whisper.cpp への移行（優先度: 中・Apple Silicon なら効果大）(#3)
 
 現在は `faster-whisper`（CTranslate2 / CPU int8）を使用。
 Apple Silicon (M1〜M4) では **whisper.cpp + Metal** に切り替えると GPU が使われ、
@@ -40,7 +86,7 @@ pip install pywhispercpp
 
 ---
 
-## 案3: 途中再開 `--resume`（優先度: 低・急がない）
+## 案3: 途中再開 `--resume`（優先度: 低・急がない）(#5)
 
 途中で中断した文字起こしを、前回の続きから再開する機能。
 
@@ -84,62 +130,26 @@ def read_last_timestamp(path: Path) -> float:
 
 ---
 
-## 案6: ファイル名入力タイムアウト（優先度: 低）
+## 案6: ファイル名入力タイムアウト ✅ 実装済み（シングルURLのみ）
 
-録音停止後のファイル名入力で、1分間入力がなければデフォルトのファイル名で自動確定する。
+終了後のファイル名変更プロンプトで、60秒間入力がなければ自動確定する。
 
-### 表示イメージ
+### 実装済みの挙動
 
 ```
 現在のファイル名: out/20260501/講義動画１.txt
+自動確定まで: 60秒...
 変更する場合は新しい名前を入力 (Enter でそのまま): 
-自動確定まで: 47秒...
 ```
 
-### 実装メモ
-
-現在の `_prompt_rename()` は `input()` でブロックする。タイムアウト付き `input` は
-macOS では `select` または `signal.alarm` で実装できる。
-
-```python
-import signal
-
-def _prompt_rename_with_timeout(path: Path, timeout: int = 60) -> Path:
-    print(f"\n現在のファイル名: {path}")
-
-    answered = threading.Event()
-    result: list[str] = [""]
-
-    def _reader():
-        try:
-            result[0] = input("変更する場合は新しい名前を入力 (Enter でそのまま): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            pass
-        finally:
-            answered.set()
-
-    t = threading.Thread(target=_reader, daemon=True)
-    t.start()
-
-    for remaining in range(timeout, 0, -1):
-        if answered.wait(1):
-            break
-        print(f"\r自動確定まで: {remaining - 1}秒...  ", end="", flush=True)
-    else:
-        print()  # 改行
-
-    answered.set()  # タイムアウト時にスレッドを解放
-    # 以降は既存のリネーム処理
-    ...
-```
-
-- カウントダウンは `\r` で同じ行を上書き
-- `input()` スレッドが終わっていれば入力内容を使い、タイムアウトならデフォルト名
-- Windows では `signal.alarm` が使えないため `msvcrt.kbhit()` を使う
+- `signal.SIGALRM`（Unix）で60秒タイムアウト
+- カウントダウンはプロンプト上の行を `\033[F` で毎秒上書き
+- Windows はタイムアウトなしのフォールバック
+- マルチURLモードはリネームプロンプトなし（自動保存）
 
 ---
 
-## 案5: 無音スキップ（優先度: 低）
+## 案5: 無音スキップ（優先度: 低）(#6)
 
 録音した30秒セグメントの RMS（音量）が閾値以下の場合、Whisper に送らずスキップする機能。
 
@@ -179,7 +189,7 @@ def is_silent(audio: np.ndarray, threshold: float = 0.002) -> bool:
 
 ---
 
-## 案1: GUI アプリ（優先度: 低・急がない）
+## 案1: GUI アプリ（優先度: 低・急がない）(#4)
 
 ターミナルを使わずに操作できる macOS ネイティブ GUI アプリ。
 

@@ -1,0 +1,127 @@
+/* moodle-transcriber GUI - モダンスタイル */
+
+QMainWindow, QWidget {
+    background: palette(window);
+    font-size: 13px;
+}
+
+#headerTitle {
+    font-size: 22px;
+    font-weight: 600;
+    padding-top: 4px;
+}
+
+#headerSubtitle {
+    font-size: 13px;
+    color: palette(placeholder-text);
+    padding-bottom: 8px;
+}
+
+#sectionTitle {
+    font-size: 11px;
+    font-weight: 600;
+    color: palette(placeholder-text);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-top: 8px;
+    margin-bottom: 4px;
+}
+
+QGroupBox {
+    border: 1px solid palette(mid);
+    border-radius: 8px;
+    margin-top: 14px;
+    padding: 12px;
+    background: palette(base);
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+    color: palette(text);
+    font-weight: 600;
+}
+
+QLabel#fieldLabel {
+    color: palette(placeholder-text);
+    font-size: 12px;
+    margin-bottom: 2px;
+}
+
+QLineEdit, QListWidget, QPlainTextEdit, QComboBox, QSpinBox {
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    padding: 6px 8px;
+    background: palette(base);
+    selection-background-color: palette(highlight);
+}
+QLineEdit:focus, QListWidget:focus, QPlainTextEdit:focus,
+QComboBox:focus, QSpinBox:focus {
+    border-color: palette(highlight);
+}
+
+QPushButton {
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    padding: 6px 14px;
+    background: palette(button);
+    min-height: 22px;
+}
+QPushButton:hover {
+    background: palette(midlight);
+}
+QPushButton:pressed {
+    background: palette(mid);
+}
+QPushButton:disabled {
+    color: palette(placeholder-text);
+}
+
+QPushButton#primaryButton {
+    background: palette(highlight);
+    color: palette(highlighted-text);
+    border: none;
+    font-weight: 600;
+    padding: 8px 18px;
+}
+QPushButton#primaryButton:hover {
+    background: palette(highlight);
+}
+QPushButton#primaryButton:disabled {
+    background: palette(mid);
+    color: palette(placeholder-text);
+}
+
+QPushButton#dangerButton {
+    border: 1px solid #c44;
+    color: #c44;
+}
+QPushButton#dangerButton:hover {
+    background: rgba(204,68,68,0.1);
+}
+
+QProgressBar {
+    border: none;
+    background: palette(midlight);
+    border-radius: 4px;
+    height: 8px;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background: palette(highlight);
+    border-radius: 4px;
+}
+
+QStatusBar {
+    border-top: 1px solid palette(mid);
+}
+
+#statusDot {
+    font-size: 18px;
+    padding-right: 4px;
+}
+
+QPlainTextEdit#logView {
+    font-family: "SF Mono", "Menlo", monospace;
+    font-size: 12px;
+}

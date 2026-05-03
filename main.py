@@ -12,6 +12,7 @@ import time
 
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
 
 from capture import create_capture, find_loopback_device, list_all_devices
@@ -30,7 +31,11 @@ from platform_utils import (
     setup_audio_for_capture,
     trigger_video_play,
 )
-from transcriber import Transcriber
+
+# faster-whisper のロードを遅延させるため Transcriber は使う直前に import する。
+# --no-transcribe 時はモデル読み込みコスト（数百MB）を避けたい。
+if TYPE_CHECKING:
+    from transcriber import Transcriber
 
 SYSTEM = platform.system()
 
@@ -176,6 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="文字起こしテキストを標準出力にリアルタイム表示（デフォルト: オフ）",
     )
+    p.add_argument(
+        "--no-transcribe",
+        action="store_true",
+        help="文字起こしせず Chrome タブの自動再生・視聴管理だけ行う（URL必須）",
+    )
     return p
 
 
@@ -284,7 +294,7 @@ def _process_one_url(
     url: str,
     idx: int,
     total: int,
-    transcriber: Transcriber,
+    transcriber: "Transcriber",
     args: argparse.Namespace,
     device_index: int | None,
     device_name: str,
@@ -377,6 +387,101 @@ def _process_one_url(
     current["capture"] = None
 
 
+def _keep_active_one_url(
+    url: str,
+    idx: int,
+    total: int,
+    args: argparse.Namespace,
+    stop_event: threading.Event,
+    current: dict,
+) -> None:
+    """文字起こしなしで Chrome タブの自動再生・視聴完了監視・離脱まで行う軽量版。"""
+    browser = args.keep_active
+
+    print(f"\n{_BOLD(f'[{idx+1}/{total}]')} {_CYN(url)}")
+
+    navigate_to_url(url, browser)
+    print("  ページ読み込み中...")
+    time.sleep(6)
+
+    actual_url = get_active_tab_url(browser) or url
+    url_pattern = _url_to_pattern(actual_url)
+    logger.info("keep-active url_pattern resolved: %r (actual_url: %r)", url_pattern, actual_url)
+
+    page_title, page_url = get_moodle_page_info(url_pattern, browser)
+    info_rows: list[tuple[str, str]] = []
+    if page_title:
+        info_rows.append(("ページ", _GRN(page_title)))
+    info_rows.append(("URL", _CYN(page_url or url)))
+    _print_session_info(info_rows)
+
+    keep_alive = WindowKeepAlive(
+        browser, args.keep_interval,
+        url_pattern=url_pattern,
+        save_interval=args.save_interval,
+    )
+    current["keep_alive"] = keep_alive
+
+    print(f"\n{_BGRN('▶  再生開始')}  {_DIM('Ctrl+C で全停止')}\n")
+    keep_alive.start()
+    _trigger_with_retry(url_pattern, browser)
+
+    poll_interval = max(5.0, args.segment_duration / 2)
+    try:
+        while not stop_event.is_set():
+            if stop_event.wait(poll_interval):
+                break
+            pct = get_viewing_percentage(url_pattern, browser)
+            ended = get_video_ended(url_pattern, browser)
+            logger.debug("keep-active poll: pct=%d ended=%s", pct, ended)
+            if pct >= 0:
+                cur_s, total_s = get_video_time(url_pattern, browser)
+                print(_DIM(_fmt_progress(pct, cur_s, total_s)))
+            if ended:
+                print(f"\n{_BGRN('視聴完了')} — 保存中...")
+                logger.info("keep-active video ended: pct=%d", pct)
+                click_save_button(url_pattern, browser)
+                time.sleep(1)
+                click_exit_activity_button(url_pattern, browser)
+                break
+    finally:
+        keep_alive.stop()
+
+    _title = _BGRN(page_title) if page_title else _DIM(url)
+    print(f"\n  {_BGRN('✔')}  {_title}  {_BGRN('done!')}")
+    if idx + 1 < total:
+        print(f"  {_DIM(f'[{idx+2}/{total}] 次の URL へ...')}")
+    current["keep_alive"] = None
+
+
+def _run_keep_active_batch(urls: list[str], args: argparse.Namespace) -> int:
+    print(f"\n{_BOLD(f'{len(urls)} 件のURLを順次再生します')} {_DIM('(文字起こしなし)')}")
+
+    stop_event = threading.Event()
+    current: dict = {"keep_alive": None}
+
+    def handle_sigint(sig, frame):
+        if not stop_event.is_set():
+            stop_event.set()
+            print("\n停止中...")
+            if current["keep_alive"]:
+                current["keep_alive"].stop()
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    for i, url in enumerate(urls):
+        if stop_event.is_set():
+            break
+        _keep_active_one_url(url, i, len(urls), args, stop_event, current)
+        if not stop_event.is_set() and i < len(urls) - 1:
+            print(f"\n  次の URL まで {_DIM('5秒待機...')}")
+            time.sleep(5)
+
+    if not stop_event.is_set():
+        print(f"\n{_BGRN('全URLの再生が完了しました')} ({len(urls)}件)")
+    return 0
+
+
 def _run_batch(
     urls: list[str],
     args: argparse.Namespace,
@@ -387,7 +492,8 @@ def _run_batch(
     print(f"\n{_BOLD(f'{len(urls)} 件の講義を順次処理します')}")
     print("  Whisperモデルを読み込み中...")
 
-    transcriber = Transcriber(
+    from transcriber import Transcriber as _Transcriber
+    transcriber = _Transcriber(
         model_size=args.model,
         language=args.language,
         cpu_threads=args.cpu_threads,
@@ -456,6 +562,17 @@ def run(args: argparse.Namespace) -> int:
     if urls and not args.keep_active:
         args.keep_active = "chrome"
 
+    # --no-transcribe: 文字起こしなしの自動再生のみ
+    if args.no_transcribe:
+        targets = urls if urls else ([args.moodle_url] if args.moodle_url else [])
+        if not targets:
+            print("エラー: --no-transcribe には --moodle-url / --urls / --url-file のいずれかが必要です",
+                  file=sys.stderr)
+            return 1
+        if not args.keep_active:
+            args.keep_active = "chrome"
+        return _run_keep_active_batch(targets, args)
+
     # 音声ルーティング自動切替（macOS + SwitchAudioSource がある場合）
     routing_changed = False
     if not args.no_auto_routing:
@@ -514,7 +631,8 @@ def run(args: argparse.Namespace) -> int:
     print(_YLW("  音量 0 でも BlackHole 録音は継続します"))
     print("  Whisperモデルを読み込み中...")
 
-    transcriber = Transcriber(
+    from transcriber import Transcriber as _Transcriber
+    transcriber = _Transcriber(
         model_size=args.model,
         language=args.language,
         cpu_threads=args.cpu_threads,

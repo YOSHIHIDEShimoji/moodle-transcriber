@@ -482,10 +482,18 @@ def run(args: argparse.Namespace) -> int:
 
     # ─── 以下、シングル URL モード（既存の動作） ─────────────────────────────
 
+    # SCORM player の view.php→player.php?a= リダイレクト後の実 URL を解決し、
+    # url_pattern を AppleScript の URL contains 検索に使う。
+    url_pattern = args.moodle_url or ""
+    if args.moodle_url and args.keep_active:
+        actual_url = get_active_tab_url(args.keep_active) or args.moodle_url
+        url_pattern = _url_to_pattern(actual_url)
+        logger.info("single url_pattern resolved: %r (actual_url: %r)", url_pattern, actual_url)
+
     # ページ情報取得（Chrome タブの DOM から読む、サーバーリクエストなし）
     page_title, page_url = None, None
     if args.moodle_url and args.keep_active:
-        page_title, page_url = get_moodle_page_info(args.moodle_url, args.keep_active)
+        page_title, page_url = get_moodle_page_info(url_pattern, args.keep_active)
 
     fmt = OutputFormat(args.format)
     now = datetime.now()
@@ -519,7 +527,7 @@ def run(args: argparse.Namespace) -> int:
     if args.keep_active:
         keep_alive = WindowKeepAlive(
             args.keep_active, args.keep_interval,
-            url_pattern=args.moodle_url,
+            url_pattern=url_pattern,
             save_interval=args.save_interval,
         )
 
@@ -541,7 +549,7 @@ def run(args: argparse.Namespace) -> int:
     if keep_alive:
         keep_alive.start()
     if args.moodle_url and args.keep_active:
-        _trigger_with_retry(args.moodle_url, args.keep_active)
+        _trigger_with_retry(url_pattern, args.keep_active)
 
     try:
         for segment in capture.segments():
@@ -554,20 +562,20 @@ def run(args: argparse.Namespace) -> int:
                     print(f"{prefix}{r.text}")
                 writer.append(r)
             if args.moodle_url and args.keep_active:
-                pct = get_viewing_percentage(args.moodle_url, args.keep_active)
-                ended = get_video_ended(args.moodle_url, args.keep_active)
+                pct = get_viewing_percentage(url_pattern, args.keep_active)
+                ended = get_video_ended(url_pattern, args.keep_active)
                 logger.debug("segment %d: pct=%d ended=%s", segment.segment_id, pct, ended)
                 if pct >= 0:
-                    cur_s, total_s = get_video_time(args.moodle_url, args.keep_active)
+                    cur_s, total_s = get_video_time(url_pattern, args.keep_active)
                     print(_DIM(_fmt_progress(pct, cur_s, total_s)))
                 if ended:
                     print(f"\n{_BGRN('視聴完了')} — 保存中...")
                     logger.info("single url video ended: pct=%d", pct)
                     if keep_alive:
                         keep_alive.stop()
-                    click_save_button(args.moodle_url, args.keep_active)
+                    click_save_button(url_pattern, args.keep_active)
                     time.sleep(1)
-                    click_exit_activity_button(args.moodle_url, args.keep_active)
+                    click_exit_activity_button(url_pattern, args.keep_active)
                     capture.stop()
                     break
     finally:

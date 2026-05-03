@@ -1,10 +1,13 @@
 """プラットフォーム固有の操作: 音声ルーティング自動切替, Moodleウィンドウキープアライブ"""
 
+import logging
 import platform
 import shutil
 import subprocess
 import threading
 import time
+
+_logger = logging.getLogger("moodle-transcriber")
 
 SYSTEM = platform.system()
 
@@ -13,17 +16,33 @@ SYSTEM = platform.system()
 _original_output: str | None = None
 
 _VISIBILITY_JS = (
-    "try{"
-    "Object.defineProperty(document,'visibilityState',{get:()=>'visible',configurable:true});"
-    "Object.defineProperty(document,'hidden',{get:()=>false,configurable:true});"
-    "document.dispatchEvent(new Event('visibilitychange'));"
-    "}catch(e){}"
+    "(function(d){"
+    "try{Object.defineProperty(d,'visibilityState',{get:()=>'visible',configurable:true});}catch(e){}"
+    "try{Object.defineProperty(d,'hidden',{get:()=>false,configurable:true});}catch(e){}"
+    "try{d.dispatchEvent(new Event('visibilitychange'));}catch(e){}"
+    "})(document);"
+    "try{for(var i=0;i<frames.length;i++){"
+    "try{(function(d){"
+    "Object.defineProperty(d,'visibilityState',{get:()=>'visible',configurable:true});"
+    "Object.defineProperty(d,'hidden',{get:()=>false,configurable:true});"
+    "d.dispatchEvent(new Event('visibilitychange'));"
+    "})(frames[i].document);}catch(e){}"
+    "}}catch(e){}"
 )
 
 _SAVE_BTN_JS = (
     "(function(){"
     "var btn=document.querySelector('#save > input[type=button]');"
     "if(btn){btn.click();return 'clicked';}"
+    "return 'not_found';"
+    "})()"
+)
+
+_EXIT_ACTIVITY_JS = (
+    "(function(){"
+    "var a=[...document.querySelectorAll('#region-main a')]"
+    ".find(function(el){return el.textContent.trim().includes('活動から抜ける');});"
+    "if(a){a.click();return 'clicked';}"
     "return 'not_found';"
     "})()"
 )
@@ -39,12 +58,28 @@ _GET_PCT_JS = (
     "})()"
 )
 
-_PLAY_VIDEO_JS = (
+_GET_PLAY_BTN_POS_JS = (
     "(function(){"
-    "var v=document.querySelector('video');"
-    "if(!v){for(var i=0;i<frames.length;i++){try{v=frames[i].document.querySelector('video');if(v)break;}catch(e){}}}"
-    "if(v){v.play();return 'playing';}"
-    "return 'no_video';"
+    "var cH=window.outerHeight-window.innerHeight;"
+    "var sels=['.vjs-big-play-button','.vjs-play-control','.big-play-button','video'];"
+    "function findPos(doc,ox,oy){"
+    "for(var s=0;s<sels.length;s++){"
+    "try{var b=doc.querySelector(sels[s]);"
+    "if(b){var r=b.getBoundingClientRect();return [ox+r.left+r.width/2,oy+r.top+r.height/2];}}"
+    "catch(e){}}"
+    "return null;}"
+    "var p=findPos(document,0,0);"
+    "if(p)return Math.round(window.screenX+p[0])+','+Math.round(window.screenY+cH+p[1]);"
+    "var ifs=document.querySelectorAll('iframe');"
+    "for(var i=0;i<ifs.length;i++){"
+    "try{"
+    "var ir=ifs[i].getBoundingClientRect();"
+    "var fd=ifs[i].contentDocument||ifs[i].contentWindow.document;"
+    "p=findPos(fd,ir.left,ir.top);"
+    "if(p)return Math.round(window.screenX+p[0])+','+Math.round(window.screenY+cH+p[1]);"
+    "if(ir.width>0&&ir.height>0)return Math.round(window.screenX+ir.left+ir.width/2)+','+Math.round(window.screenY+cH+ir.top+ir.height/2);"
+    "}catch(e){}}"
+    "return Math.round(window.screenX+window.innerWidth/2)+','+Math.round(window.screenY+cH+window.innerHeight/2);"
     "})()"
 )
 
@@ -54,6 +89,15 @@ _GET_VIDEO_TIME_JS = (
     "if(!v){for(var i=0;i<frames.length;i++){try{v=frames[i].document.querySelector('video');if(v)break;}catch(e){}}}"
     "if(v){return v.currentTime+'|'+v.duration;}"
     "return '-1|-1';"
+    "})()"
+)
+
+_VIDEO_ENDED_JS = (
+    "(function(){"
+    "var v=document.querySelector('video');"
+    "if(!v){for(var i=0;i<frames.length;i++){try{v=frames[i].document.querySelector('video');if(v)break;}catch(e){}}}"
+    "if(v){return v.ended?'true':'false';}"
+    "return 'unknown';"
     "})()"
 )
 
@@ -220,9 +264,64 @@ def navigate_to_url(url: str, browser: str = "chrome") -> None:
     subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
 
 
+def get_active_tab_url(browser: str = "chrome") -> str | None:
+    """フロントウィンドウのアクティブタブの URL を返す（リダイレクト後の実 URL）。"""
+    if SYSTEM != "Darwin":
+        return None
+    app = _MACOS_APPS.get(browser.lower(), browser)
+    script = f'tell application "{app}" to return URL of active tab of front window'
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=5)
+    if result.returncode == 0:
+        return result.stdout.strip() or None
+    return None
+
+
 def trigger_video_play(url_pattern: str, browser: str = "chrome") -> bool:
-    """Moodle タブの動画再生を開始する。成功時 True。"""
-    return _run_js_in_tab(_PLAY_VIDEO_JS, url_pattern, browser) == "playing"
+    """
+    Moodle タブの動画再生を開始する。成功時 True。
+    macOS: AppleScript で実際のマウスクリックをシミュレートする（autoplay policy 回避）。
+    非macOS: v.play() を直接呼ぶ（フォールバック）。
+    """
+    if SYSTEM != "Darwin":
+        raw = _run_js_in_tab(
+            "(function(){var v=document.querySelector('video');"
+            "if(!v){for(var i=0;i<frames.length;i++){try{v=frames[i].document.querySelector('video');if(v)break;}catch(e){}}}"
+            "if(v){v.play();return 'playing';}return 'no_video';})()",
+            url_pattern, browser,
+        )
+        return raw == "playing"
+
+    app = _MACOS_APPS.get(browser.lower(), browser)
+    raw = _run_js_in_tab(_GET_PLAY_BTN_POS_JS, url_pattern, browser)
+    _logger.debug("trigger_video_play raw=%r pattern=%r", raw, url_pattern)
+    if not raw or "," not in raw:
+        return False
+    try:
+        x, y = raw.strip().split(",")
+        # Step1: OS レベルクリックでユーザージェスチャーを Chrome に登録する
+        script = (
+            f'tell application "{app}" to activate\n'
+            f'delay 0.3\n'
+            f'tell application "System Events" to click at {{{int(float(x))}, {int(float(y))}}}'
+        )
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+        if result.returncode != 0:
+            return False
+        # Step2: ユーザージェスチャー登録後に video.play() を JS で呼ぶ
+        # クリック座標がボタンに当たらない場合でもこちらで再生を保証する
+        time.sleep(0.5)
+        _run_js_in_tab(
+            "(function(){"
+            "var v=document.querySelector('video');"
+            "if(!v){for(var i=0;i<frames.length;i++){try{v=frames[i].document.querySelector('video');if(v)break;}catch(e){}}}"
+            "if(v){try{v.play();}catch(e){}}"
+            "})()",
+            url_pattern, browser,
+        )
+        return True
+    except Exception as e:
+        _logger.debug("trigger_video_play exception: %s", e)
+        return False
 
 
 def get_viewing_percentage(url_pattern: str, browser: str = "chrome") -> int:
@@ -247,6 +346,17 @@ def get_video_time(url_pattern: str, browser: str = "chrome") -> tuple[float, fl
 def click_save_button(url_pattern: str, browser: str = "chrome") -> bool:
     """「視聴状況を保存」ボタン (#save > input[type=button]) をクリックする。成功時 True。"""
     return _run_js_in_tab(_SAVE_BTN_JS, url_pattern, browser) == "clicked"
+
+
+def click_exit_activity_button(url_pattern: str, browser: str = "chrome") -> bool:
+    """「活動から抜ける」リンクをクリックする。成功時 True。"""
+    return _run_js_in_tab(_EXIT_ACTIVITY_JS, url_pattern, browser) == "clicked"
+
+
+def get_video_ended(url_pattern: str, browser: str = "chrome") -> bool:
+    """動画の ended プロパティを返す。取得失敗時は False。"""
+    raw = _run_js_in_tab(_VIDEO_ENDED_JS, url_pattern, browser)
+    return raw == "true"
 
 
 class WindowKeepAlive:

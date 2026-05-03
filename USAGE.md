@@ -83,9 +83,9 @@ python main.py --moodle-url "moodle.example.com" --model small
 # SRT 字幕形式で出力
 python main.py --moodle-url "moodle.example.com" --format srt
 
-# 出力ファイル名を直接指定（カレントディレクトリに保存）
-python main.py --moodle-url "moodle.example.com" --output 解剖学_第3回
-# → ./解剖学_第3回.txt に保存（out/YYYYMMDD/ は使わない）
+# 出力ディレクトリを指定（ページタイトルでファイル名が自動生成される）
+python main.py --moodle-url "moodle.example.com" --output 解剖学
+# → ./解剖学/講義動画１.txt に保存（out/YYYYMMDD/ の代わりに使われる）
 
 # 自動音声切替を使わない（すでに手動でMulti-Output Deviceに設定済みの場合）
 python main.py --moodle-url "moodle.example.com" --no-auto-routing
@@ -139,20 +139,20 @@ https://moodle.example.com/mod/scorm/player.php?id=103
 2. 動画を自動再生
 3. 文字起こし開始
 4. 60秒ごとに「視聴状況を保存」ボタンを自動クリック
-5. 視聴状況が 100% になったら次の URL へ
-6. 全 URL 完了後に macOS 通知
+5. 視聴状況が 100% になったら「視聴状況を保存」→「活動から抜ける」を自動クリック
+6. ファイルを保存してターミナルに完了サマリーを表示
+7. 5秒待機 → 次の URL へ
+8. 全 URL 完了後に macOS 通知
 
 ### 注意事項
 
 - **Chrome が前面にある状態で実行すること**（URL 遷移が Chrome のアクティブタブに対して行われる）
 - 動画再生中はブラウザを別タブに移動しても問題ない（JS 注入で視聴状況は維持される）
 - Ctrl+C で途中停止した場合、その時点までの文字起こしは保存される
-- 同じタイトルの講義が複数ある場合、ファイル名に `_2`, `_3` ... が自動付与される（上書きしない）
-
 ```
 out/20260501/
 ├── 講義動画１.txt       # 1本目
-├── 講義動画１_2.txt     # 同名タイトルの2本目
+├── 講義動画１_2.txt     # 同名タイトルの2本目（自動連番）
 └── 講義動画２.txt
 ```
 
@@ -170,7 +170,7 @@ out/20260501/
 | `--keep-interval 秒` | 20 | JS再注入の間隔（秒） |
 | `-m MODEL` | `large-v3` | Whisperモデル: `tiny` / `small` / `medium` / `large-v3` |
 | `-f FORMAT` | `txt` | 出力形式: `txt` / `srt` / `vtt` |
-| `-o NAME` | 自動生成 | 出力ファイルのベース名。**指定時はカレントディレクトリに `NAME.txt` として保存**（`out/YYYYMMDD/` を使わない） |
+| `-o DIR` | 自動生成 | 出力ディレクトリ。**指定時は `DIR/ページタイトル.txt` として保存**（`out/YYYYMMDD/` の代わりに使われる） |
 | `-l LANG` | `ja` | 文字起こし言語（ISO 639-1） |
 | `--no-auto-routing` | — | 音声出力の自動切替を無効化 |
 | `--restore-to DEVICE` | 起動前のデバイス | 終了時に戻す出力デバイス名（例: `'MacBook Proのスピーカー'`） |
@@ -187,9 +187,14 @@ out/20260501/
 
 | 状況 | 保存先 |
 |---|---|
-| `-o NAME` 指定 | `./NAME.txt`（カレントディレクトリ直下） |
-| `-o` 未指定 + `--moodle-url` あり | `./out/YYYYMMDD/講義動画タイトル.txt`（h1から自動生成） |
+| `-o DIR` 指定 + `--moodle-url` あり | `./DIR/講義動画タイトル.txt` |
+| `-o DIR` 指定 + `--moodle-url` なし | `./DIR/lecture_HHMMSS.txt` |
+| `-o` 未指定 + `--moodle-url` あり | `./out/YYYYMMDD/講義動画タイトル.txt` |
 | `-o` 未指定 + `--moodle-url` なし | `./out/YYYYMMDD/lecture_HHMMSS.txt` |
+
+同名ファイルが既に存在する場合は `_2`, `_3` ... が自動付与される（上書きしない）。
+
+終了時（Ctrl+C または視聴率100%の自動終了）にファイル名変更プロンプトが表示される。60秒で無入力なら自動確定。
 
 ### TXT 形式（デフォルト）
 
@@ -217,6 +222,17 @@ out/20260501/
 2
 00:00:28,200 --> 00:00:35,100
 まず、リン脂質二重層の基本的な配置から見ていきましょう。
+```
+
+### 完了時の表示
+
+視聴率100%到達または Ctrl+C 後、以下のサマリーがターミナルに表示される。
+
+```
+  ✔  講義動画１  done!
+  URL    https://moodle.example.com/mod/scorm/player.php?id=101
+  保存   out/20260501/講義動画１.txt
+  [2/3] 次の URL へ...     ← マルチURLのみ
 ```
 
 ---

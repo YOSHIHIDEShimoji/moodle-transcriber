@@ -183,15 +183,17 @@ def test_multi_url_utils() -> None:
     from pathlib import Path
     from main import _url_to_pattern, _collect_urls, _unique_path
 
-    # _url_to_pattern: id= クエリパラメータを抽出
+    # _url_to_pattern: id= / a= クエリパラメータを抽出
     cases = [
         ("https://moodle.example.com/mod/scorm/player.php?id=123", "id=123"),
         ("https://moodle.example.com/mod/scorm/player.php?id=456&cm=789", "id=456"),
+        # SCORM player.php?a= (リダイレクト後の実URL)
+        ("https://moodle.gs.chiba-u.jp/moodle/mod/scorm/player.php?a=176267&currentorg&scoid=352590", "a=176267"),
         ("https://moodle.example.com/course/view.php", "moodle.example.com/course/view.php"),
     ]
     for url, expected in cases:
         got = _url_to_pattern(url)
-        check(f"_url_to_pattern id={expected}", got == expected, f"got={got!r}")
+        check(f"_url_to_pattern({expected})", got == expected, f"got={got!r}")
 
     # _collect_urls: --urls
     args = argparse.Namespace(urls=["https://a.com", "https://b.com"], url_file=None)
@@ -307,6 +309,289 @@ def test_new_args() -> None:
     check("--url-file 解析", args_uf.url_file == "urls.txt")
 
 
+# ─── 10. video.ended=True で capture.stop() が1回のみ呼ばれてループ終了 ──────
+
+def test_pct100_auto_stop() -> None:
+    print("\n[10] pct >= 100: capture.stop() 1回のみ・ループ正常終了")
+    import argparse, threading
+    from unittest.mock import MagicMock, patch
+    from main import _process_one_url
+
+    stop_call_count = [0]
+
+    def fake_stop():
+        stop_call_count[0] += 1
+
+    mock_capture = MagicMock()
+    mock_capture.stop.side_effect = fake_stop
+
+    mock_seg1 = MagicMock()
+    mock_seg1.segment_id = 1
+    mock_seg1.data = np.zeros(16000, dtype=np.float32)
+    mock_seg1.start_time = 0.0
+    mock_seg2 = MagicMock()
+    mock_seg2.segment_id = 2
+    mock_seg2.data = np.zeros(16000, dtype=np.float32)
+    mock_seg2.start_time = 30.0
+    mock_capture.segments.return_value = iter([mock_seg1, mock_seg2])
+
+    mock_transcriber = MagicMock()
+    mock_transcriber.transcribe.return_value = []
+
+    args = argparse.Namespace(
+        keep_active="chrome", verbose=False, timestamps=False, print_transcript=False,
+        format="txt", output=None, model="tiny", language="ja",
+        segment_duration=30.0, overlap=5.0,
+        keep_interval=20.0, save_interval=60.0,
+    )
+    stop_event = threading.Event()
+    current: dict = {"keep_alive": None, "capture": None}
+
+    ended_seq = iter([False, True])
+
+    with patch("main.navigate_to_url"), \
+         patch("main.time.sleep"), \
+         patch("main.get_active_tab_url", return_value="https://example.com/mod/scorm/player.php?id=42"), \
+         patch("main.get_moodle_page_info", return_value=("テスト講義", "https://example.com")), \
+         patch("main.create_capture", return_value=mock_capture), \
+         patch("main.WindowKeepAlive", return_value=MagicMock()), \
+         patch("main.trigger_video_play"), \
+         patch("main.get_viewing_percentage", return_value=100), \
+         patch("main.get_video_ended", side_effect=lambda *a, **kw: next(ended_seq, True)), \
+         patch("main.get_video_time", return_value=(1800.0, 3600.0)), \
+         patch("main.click_save_button"), \
+         patch("main.click_exit_activity_button"), \
+         patch("main.OutputWriter"):
+        _process_one_url(
+            "https://example.com/mod/scorm/player.php?id=42",
+            0, 2, mock_transcriber, args,
+            0, "BlackHole 2ch", current, stop_event,
+        )
+
+    check("pct=100: capture.stop() 1回のみ", stop_call_count[0] == 1,
+          f"実際の呼び出し回数: {stop_call_count[0]}")
+    check("pct=100: stop_event は未設定（正常終了）", not stop_event.is_set())
+
+
+# ─── 11. シングルURL _unique_path 適用確認 ────────────────────────────────────
+
+def test_single_url_unique_path() -> None:
+    print("\n[11] シングルURL: 同名ファイルに _2, _3 連番が付く")
+    import argparse, threading, tempfile, os
+    from unittest.mock import MagicMock, patch
+    from pathlib import Path
+
+    captured_paths: list[Path] = []
+
+    def fake_output_writer(path, *args, **kwargs):
+        captured_paths.append(path)
+        m = MagicMock()
+        m.__enter__ = lambda s: s
+        m.__exit__ = MagicMock(return_value=False)
+        return m
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir) / "20260101"
+        base.mkdir()
+        existing = base / "テスト講義.txt"
+        existing.touch()
+
+        args = argparse.Namespace(
+            keep_active="chrome", verbose=False, timestamps=False,
+            format="txt", output=None, model="tiny", language="ja",
+            segment_duration=30.0, overlap=5.0,
+            keep_interval=20.0, save_interval=60.0,
+            moodle_url="example.com",
+        )
+
+        mock_capture = MagicMock()
+        mock_capture.segments.return_value = iter([])
+        mock_transcriber = MagicMock()
+        mock_transcriber.transcribe.return_value = []
+
+        with patch("main.navigate_to_url"), \
+             patch("main.time.sleep"), \
+             patch("main.get_active_tab_url", return_value="https://example.com/mod/scorm/player.php?id=1"), \
+             patch("main.get_moodle_page_info", return_value=("テスト講義", "https://example.com")), \
+             patch("main.create_capture", return_value=mock_capture), \
+             patch("main.WindowKeepAlive", return_value=MagicMock()), \
+             patch("main.trigger_video_play"), \
+             patch("main.get_viewing_percentage", return_value=-1), \
+             patch("main.OutputWriter", side_effect=fake_output_writer), \
+             patch("main.Path") as mock_path_cls:
+
+            from main import _process_one_url
+            import threading
+            stop_event = threading.Event()
+            current: dict = {"keep_alive": None, "capture": None}
+
+            # out/YYYYMMDD ディレクトリを tmpdir に向ける
+            real_path = Path
+            def patched_path(*args2, **kwargs2):
+                p = real_path(*args2, **kwargs2)
+                if str(p).startswith("out/"):
+                    p = real_path(tmpdir) / real_path(*args2[1:] if len(args2) > 1 else args2)
+                return p
+            mock_path_cls.side_effect = patched_path
+
+    # _unique_path の単体動作確認（シングルURL相当）
+    from main import _unique_path
+    with tempfile.TemporaryDirectory() as tmpdir2:
+        p = Path(tmpdir2) / "テスト講義.txt"
+        p.touch()
+        p2 = _unique_path(p)
+        check("_unique_path: 1件重複 → _2", p2.name == "テスト講義_2.txt", f"got={p2.name}")
+        p2.touch()
+        p3 = _unique_path(p)
+        check("_unique_path: 2件重複 → _3", p3.name == "テスト講義_3.txt", f"got={p3.name}")
+        p_new = Path(tmpdir2) / "新規講義.txt"
+        check("_unique_path: 重複なし → そのまま", _unique_path(p_new) == p_new)
+
+
+# ─── 12. _run_batch: 全URL順次処理 + URL間5秒待機 ───────────────────────────
+
+def test_run_batch_all_urls() -> None:
+    print("\n[12] _run_batch: 全URL順次処理 + URL間5秒待機")
+    import argparse
+    from unittest.mock import MagicMock, patch
+    from main import _run_batch
+
+    processed: list[tuple[str, int, int]] = []  # (url, idx, total)
+
+    def fake_process(url, idx, total, transcriber, args, device_index, device_name, current, stop_event):
+        processed.append((url, idx, total))
+
+    urls = [
+        "https://moodle.example.com/mod/scorm/player.php?id=101",
+        "https://moodle.example.com/mod/scorm/player.php?id=102",
+        "https://moodle.example.com/mod/scorm/player.php?id=103",
+    ]
+    args = argparse.Namespace(
+        model="tiny", language="ja", cpu_threads=8,
+        keep_active="chrome", verbose=False, timestamps=False, print_transcript=False,
+        format="txt", output=None,
+        segment_duration=30.0, overlap=5.0,
+        keep_interval=20.0, save_interval=60.0,
+        restore_to=None,
+    )
+    sleep_calls: list[float] = []
+
+    with patch("main.Transcriber", return_value=MagicMock()), \
+         patch("main._process_one_url", side_effect=fake_process), \
+         patch("main.time.sleep", side_effect=lambda s: sleep_calls.append(s)), \
+         patch("main.restore_audio_output"), \
+         patch("subprocess.run"):
+        _run_batch(urls, args, 0, "BlackHole 2ch", False)
+
+    check("3件全URL処理", [u for u, _, _ in processed] == urls,
+          f"got={[u for u, _, _ in processed]}")
+    check("idx が 0,1,2 の順", [i for _, i, _ in processed] == [0, 1, 2])
+    check("total=3 で統一", all(t == 3 for _, _, t in processed))
+    check("URL間に5秒待機が2回（最後はなし）", sleep_calls.count(5) == 2,
+          f"5秒sleep回数: {sleep_calls.count(5)}")
+
+
+# ─── 13. _run_batch: stop_event で途中停止 ───────────────────────────────────
+
+def test_run_batch_stop_event() -> None:
+    print("\n[13] _run_batch: Ctrl-C で1件目以降をスキップ")
+    import argparse
+    from unittest.mock import MagicMock, patch
+    from main import _run_batch
+
+    processed_urls: list[str] = []
+
+    def fake_process(url, idx, total, transcriber, args, device_index, device_name, current, stop_event):
+        processed_urls.append(url)
+        stop_event.set()  # 1件目処理後に Ctrl-C をシミュレート
+
+    urls = [
+        "https://moodle.example.com/mod/scorm/player.php?id=101",
+        "https://moodle.example.com/mod/scorm/player.php?id=102",
+        "https://moodle.example.com/mod/scorm/player.php?id=103",
+    ]
+    args = argparse.Namespace(
+        model="tiny", language="ja", cpu_threads=8,
+        keep_active="chrome", verbose=False, timestamps=False, print_transcript=False,
+        format="txt", output=None,
+        segment_duration=30.0, overlap=5.0,
+        keep_interval=20.0, save_interval=60.0,
+        restore_to=None,
+    )
+
+    with patch("main.Transcriber", return_value=MagicMock()), \
+         patch("main._process_one_url", side_effect=fake_process), \
+         patch("main.time.sleep"), \
+         patch("main.restore_audio_output"), \
+         patch("subprocess.run"):
+        _run_batch(urls, args, 0, "BlackHole 2ch", False)
+
+    check("Ctrl-C 後は1件のみ処理", len(processed_urls) == 1,
+          f"処理件数: {len(processed_urls)}")
+    check("処理されたのは1件目のみ", processed_urls == [urls[0]],
+          f"got={processed_urls}")
+
+
+# ─── 14. _process_one_url: navigate + save/exit ボタン呼び出し確認 ─────────
+
+def test_process_one_url_navigate_and_buttons() -> None:
+    print("\n[14] _process_one_url: navigate_to_url + click_save + click_exit が呼ばれる")
+    import argparse, threading
+    from unittest.mock import MagicMock, patch
+    from main import _process_one_url
+
+    target_url = "https://moodle.example.com/mod/scorm/player.php?id=99"
+
+    mock_capture = MagicMock()
+    mock_seg = MagicMock()
+    mock_seg.segment_id = 1
+    mock_seg.data = np.zeros(16000, dtype=np.float32)
+    mock_seg.start_time = 0.0
+    mock_capture.segments.return_value = iter([mock_seg])
+
+    mock_transcriber = MagicMock()
+    mock_transcriber.transcribe.return_value = []
+
+    args = argparse.Namespace(
+        keep_active="chrome", verbose=False, timestamps=False, print_transcript=False,
+        format="txt", output=None, model="tiny", language="ja",
+        segment_duration=30.0, overlap=5.0,
+        keep_interval=20.0, save_interval=60.0,
+    )
+    stop_event = threading.Event()
+    current: dict = {"keep_alive": None, "capture": None}
+
+    navigate_calls: list[str] = []
+    save_calls: list = []
+    exit_calls: list = []
+
+    with patch("main.navigate_to_url", side_effect=lambda url, *a, **kw: navigate_calls.append(url)), \
+         patch("main.time.sleep"), \
+         patch("main.get_active_tab_url", return_value=target_url), \
+         patch("main.get_moodle_page_info", return_value=("テスト講義99", target_url)), \
+         patch("main.create_capture", return_value=mock_capture), \
+         patch("main.WindowKeepAlive", return_value=MagicMock()), \
+         patch("main.trigger_video_play"), \
+         patch("main.get_viewing_percentage", return_value=100), \
+         patch("main.get_video_ended", return_value=True), \
+         patch("main.get_video_time", return_value=(3600.0, 3600.0)), \
+         patch("main.click_save_button", side_effect=lambda *a, **kw: save_calls.append(1)), \
+         patch("main.click_exit_activity_button", side_effect=lambda *a, **kw: exit_calls.append(1)), \
+         patch("main.OutputWriter"):
+        _process_one_url(
+            target_url, 0, 2, mock_transcriber, args,
+            0, "BlackHole 2ch", current, stop_event,
+        )
+
+    check("navigate_to_url が対象URLで呼ばれた", target_url in navigate_calls,
+          f"navigate calls: {navigate_calls}")
+    check("click_save_button が1回呼ばれた", len(save_calls) == 1,
+          f"呼び出し回数: {len(save_calls)}")
+    check("click_exit_activity_button が1回呼ばれた", len(exit_calls) == 1,
+          f"呼び出し回数: {len(exit_calls)}")
+    check("current が後片付けされた", current["keep_alive"] is None and current["capture"] is None)
+
+
 # ─── main ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -324,6 +609,11 @@ if __name__ == "__main__":
     test_multi_url_utils()
     test_window_keep_alive_save_interval()
     test_new_args()
+    test_pct100_auto_stop()
+    test_single_url_unique_path()
+    test_run_batch_all_urls()
+    test_run_batch_stop_event()
+    test_process_one_url_navigate_and_buttons()
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

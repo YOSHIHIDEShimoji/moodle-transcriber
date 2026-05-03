@@ -1,12 +1,15 @@
 """Moodle講義音声 オンデバイス自動文字起こし"""
 
 import argparse
+import logging
+import logging.handlers
 import platform
 import re
 import signal
 import sys
 import threading
 import time
+
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -15,8 +18,11 @@ from capture import create_capture, find_loopback_device, list_all_devices
 from output import OutputFormat, OutputWriter, _fmt_ts
 from platform_utils import (
     WindowKeepAlive,
+    click_exit_activity_button,
     click_save_button,
+    get_active_tab_url,
     get_moodle_page_info,
+    get_video_ended,
     get_video_time,
     get_viewing_percentage,
     navigate_to_url,
@@ -27,6 +33,25 @@ from platform_utils import (
 from transcriber import Transcriber
 
 SYSTEM = platform.system()
+
+
+def _setup_logging() -> logging.Logger:
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        log_dir / "moodle-transcriber.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _logger = logging.getLogger("moodle-transcriber")
+    _logger.setLevel(logging.DEBUG)
+    _logger.addHandler(handler)
+    return _logger
+
+
+logger = _setup_logging()
 
 
 # ─── ターミナルカラー ──────────────────────────────────────────────────────────
@@ -74,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-o", "--output",
         default=None,
-        help="出力ファイルパス。指定時はout/YYYYMMDD/を使わずそのまま保存 (例: -o 解剖学_第3回)",
+        help="出力ディレクトリ。指定時はout/YYYYMMDD/の代わりにそのディレクトリへ保存 (例: -o 解剖学)",
     )
     p.add_argument("-f", "--format", choices=["txt", "srt", "vtt"], default="txt", help="出力フォーマット")
     p.add_argument(
@@ -146,6 +171,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="各行に [HH:MM:SS] タイムスタンプを付与（デフォルト: オフ）",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="詳細ログを表示")
+    p.add_argument(
+        "--print-transcript",
+        action="store_true",
+        help="文字起こしテキストを標準出力にリアルタイム表示（デフォルト: オフ）",
+    )
     return p
 
 
@@ -155,14 +185,37 @@ def _sanitize_filename(name: str) -> str:
     return name[:80]
 
 
-def _prompt_rename(path: Path) -> Path:
-    """Ctrl+C 後に現在のファイル名を表示し、変更するか確認する。"""
+def _trigger_with_retry(url_pattern: str, browser: str, attempts: int = 5, interval: float = 3.0) -> None:
+    """動画再生を試みる。SCORMプレーヤーの初期化待ちのためリトライする。"""
+    for i in range(attempts):
+        if trigger_video_play(url_pattern, browser):
+            logger.info("video play triggered (attempt %d)", i + 1)
+            return
+        logger.warning("trigger_video_play: no_video (attempt %d/%d)", i + 1, attempts)
+        if i < attempts - 1:
+            time.sleep(interval)
+    print("  警告: 動画が見つかりませんでした。手動で再生してください。")
+    logger.warning("trigger_video_play: gave up after %d attempts", attempts)
+
+
+def _prompt_rename(path: Path, timeout: int = 60) -> Path:
+    use_alarm = SYSTEM != "Windows" and hasattr(signal, "SIGALRM")
     print(f"\n現在のファイル名: {_CYN(str(path))}")
+    print(f"変更する場合は新しい名前を入力 ({timeout}秒で自動確定): ", end="", flush=True)
+    answer = ""
+    if use_alarm:
+        def _alarm(sig, frame):
+            raise TimeoutError()
+        old_handler = signal.signal(signal.SIGALRM, _alarm)
+        signal.alarm(timeout)
     try:
-        answer = input("変更する場合は新しい名前を入力 (Enter でそのまま): ").strip()
-    except (EOFError, KeyboardInterrupt):
+        answer = input("").strip()
+    except (TimeoutError, EOFError, KeyboardInterrupt):
         print()
-        return path
+    finally:
+        if use_alarm:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
     if not answer:
         return path
     new_name = _sanitize_filename(answer)
@@ -194,6 +247,9 @@ def _url_to_pattern(url: str) -> str:
     qs = parse_qs(parsed.query)
     if "id" in qs:
         return f"id={qs['id'][0]}"
+    # SCORM player URL: player.php?a=XXXXX (リダイレクト後)
+    if "a" in qs:
+        return f"a={qs['a'][0]}"
     return parsed.netloc + parsed.path
 
 
@@ -220,7 +276,6 @@ def _process_one_url(
     stop_event: threading.Event,
 ) -> None:
     browser = args.keep_active
-    url_pattern = _url_to_pattern(url)
 
     print(f"\n{_BOLD(f'[{idx+1}/{total}]')} {_CYN(url)}")
 
@@ -228,19 +283,20 @@ def _process_one_url(
     print("  ページ読み込み中...")
     time.sleep(6)
 
+    # navigate_to_url はアクティブタブを遷移させる。SCORM player へのリダイレクト後、
+    # アクティブタブの実URLを取得してパターンを解決する（view.php?id= → player.php?a=）。
+    actual_url = get_active_tab_url(browser) or url
+    url_pattern = _url_to_pattern(actual_url)
+    logger.info("url_pattern resolved: %r (actual_url: %r)", url_pattern, actual_url)
+
     page_title, page_url = get_moodle_page_info(url_pattern, browser)
 
     fmt = OutputFormat(args.format)
-    if args.output:
-        base = args.output if total == 1 else f"{args.output}_{idx+1:02d}"
-        output_path = _unique_path(Path(f"{base}.{fmt.value}"))
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        now = datetime.now()
-        out_dir = Path("out") / now.strftime("%Y%m%d")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        filename = _sanitize_filename(page_title) if page_title else f"lecture_{now.strftime('%H%M%S')}"
-        output_path = _unique_path(out_dir / f"{filename}.{fmt.value}")
+    now = datetime.now()
+    out_dir = Path(args.output) if args.output else Path("out") / now.strftime("%Y%m%d")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filename = _sanitize_filename(page_title) if page_title else f"lecture_{now.strftime('%H%M%S')}"
+    output_path = _unique_path(out_dir / f"{filename}.{fmt.value}")
 
     info_rows: list[tuple[str, str]] = []
     if page_title:
@@ -263,7 +319,7 @@ def _process_one_url(
     print(f"\n{_BGRN('▶  録音開始')}  {_DIM('Ctrl+C で全停止')}\n")
     capture.start()
     keep_alive.start()
-    trigger_video_play(url_pattern, browser)
+    _trigger_with_retry(url_pattern, browser)
 
     try:
         for segment in capture.segments():
@@ -273,21 +329,34 @@ def _process_one_url(
                 print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜")
             results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
             for r in results:
-                prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
-                print(f"{prefix}{r.text}")
+                if args.print_transcript:
+                    prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
+                    print(f"{prefix}{r.text}")
                 writer.append(r)
             pct = get_viewing_percentage(url_pattern, browser)
+            ended = get_video_ended(url_pattern, browser)
+            logger.debug("segment %d: pct=%d ended=%s", segment.segment_id, pct, ended)
             if pct >= 0:
                 cur_s, total_s = get_video_time(url_pattern, browser)
                 print(_DIM(_fmt_progress(pct, cur_s, total_s)))
-            if pct >= 100:
-                print(f"\n{_BGRN('視聴完了')} ({pct}%) — 次の URL へ")
+            if ended:
+                print(f"\n{_BGRN('視聴完了')} — 保存中...")
+                logger.info("video ended: pct=%d", pct)
+                click_save_button(url_pattern, browser)
+                time.sleep(1)
+                click_exit_activity_button(url_pattern, browser)
                 capture.stop()
+                break
     finally:
         keep_alive.stop()
         writer.finalize()
 
-    print(f"{_BGRN('保存完了')}: {_CYN(str(output_path))}")
+    _title = _BGRN(page_title) if page_title else _DIM(url)
+    print(f"\n  {_BGRN('✔')}  {_title}  {_BGRN('done!')}")
+    print(f"  {_DIM('URL')}   {_DIM(page_url or url)}")
+    print(f"  {_DIM('保存')}  {_CYN(str(output_path))}")
+    if idx + 1 < total:
+        print(f"  {_DIM(f'[{idx+2}/{total}] 次の URL へ...')}")
     current["keep_alive"] = None
     current["capture"] = None
 
@@ -402,17 +471,12 @@ def run(args: argparse.Namespace) -> int:
     if args.moodle_url and args.keep_active:
         page_title, page_url = get_moodle_page_info(args.moodle_url, args.keep_active)
 
-    # 出力パス: -o 指定時はそのまま保存、未指定は ./out/YYYYMMDD/ 以下に自動生成
     fmt = OutputFormat(args.format)
-    if args.output:
-        output_path = Path(f"{args.output}.{fmt.value}")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        now = datetime.now()
-        out_dir = Path("out") / now.strftime("%Y%m%d")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        filename = _sanitize_filename(page_title) if page_title else f"lecture_{now.strftime('%H%M%S')}"
-        output_path = out_dir / f"{filename}.{fmt.value}"
+    now = datetime.now()
+    out_dir = Path(args.output) if args.output else Path("out") / now.strftime("%Y%m%d")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filename = _sanitize_filename(page_title) if page_title else f"lecture_{now.strftime('%H%M%S')}"
+    output_path = _unique_path(out_dir / f"{filename}.{fmt.value}")
 
     # セッション情報を整形表示
     info_rows: list[tuple[str, str]] = []
@@ -456,10 +520,12 @@ def run(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGINT, handle_sigint)
 
-    print(f"\n{_BGRN('▶  録音開始')}  Moodleで動画を再生してください。{_DIM('Ctrl+C で停止')}\n")
+    print(f"\n{_BGRN('▶  録音開始')}  {_DIM('Ctrl+C で停止')}\n")
     capture.start()
     if keep_alive:
         keep_alive.start()
+    if args.moodle_url and args.keep_active:
+        _trigger_with_retry(args.moodle_url, args.keep_active)
 
     try:
         for segment in capture.segments():
@@ -467,25 +533,37 @@ def run(args: argparse.Namespace) -> int:
                 print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜")
             results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
             for r in results:
-                prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
-                print(f"{prefix}{r.text}")
+                if args.print_transcript:
+                    prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
+                    print(f"{prefix}{r.text}")
                 writer.append(r)
             if args.moodle_url and args.keep_active:
                 pct = get_viewing_percentage(args.moodle_url, args.keep_active)
+                ended = get_video_ended(args.moodle_url, args.keep_active)
+                logger.debug("segment %d: pct=%d ended=%s", segment.segment_id, pct, ended)
                 if pct >= 0:
                     cur_s, total_s = get_video_time(args.moodle_url, args.keep_active)
                     print(_DIM(_fmt_progress(pct, cur_s, total_s)))
-                if pct >= 100:
-                    print(f"\n{_BGRN('視聴完了')} ({pct}%) — 自動終了")
+                if ended:
+                    print(f"\n{_BGRN('視聴完了')} — 保存中...")
+                    logger.info("single url video ended: pct=%d", pct)
                     if keep_alive:
                         keep_alive.stop()
+                    click_save_button(args.moodle_url, args.keep_active)
+                    time.sleep(1)
+                    click_exit_activity_button(args.moodle_url, args.keep_active)
                     capture.stop()
+                    break
     finally:
         writer.finalize()
         if routing_changed:
             restore_audio_output(restore_to=args.restore_to)
         output_path = _prompt_rename(output_path)
-        print(f"\n{_BGRN('保存完了')}: {_CYN(str(output_path))}")
+        _title = _BGRN(page_title) if page_title else ""
+        print(f"\n  {_BGRN('✔')}  {(_title + '  ') if _title else ''}{_BGRN('done!')}")
+        if page_url:
+            print(f"  {_DIM('URL')}   {_DIM(page_url)}")
+        print(f"  {_DIM('保存')}  {_CYN(str(output_path))}")
 
     return 0
 

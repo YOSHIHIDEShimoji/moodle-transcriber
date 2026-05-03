@@ -201,7 +201,18 @@ def _trigger_with_retry(url_pattern: str, browser: str, attempts: int = 5, inter
 def _prompt_rename(path: Path, timeout: int = 60) -> Path:
     use_alarm = SYSTEM != "Windows" and hasattr(signal, "SIGALRM")
     print(f"\n現在のファイル名: {_CYN(str(path))}")
-    print(f"変更する場合は新しい名前を入力 ({timeout}秒で自動確定): ", end="", flush=True)
+    print(f"変更する場合は新しい名前を編集 ({timeout}秒で自動確定): ", end="", flush=True)
+
+    prefill = path.stem
+    try:
+        import readline
+        def _hook():
+            readline.insert_text(prefill)
+            readline.redisplay()
+        readline.set_pre_input_hook(_hook)
+    except Exception:
+        readline = None  # type: ignore[assignment]
+
     answer = ""
     if use_alarm:
         def _alarm(sig, frame):
@@ -216,7 +227,12 @@ def _prompt_rename(path: Path, timeout: int = 60) -> Path:
         if use_alarm:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old_handler)
-    if not answer:
+        if readline is not None:
+            try:
+                readline.set_pre_input_hook(None)
+            except Exception:
+                pass
+    if not answer or answer == prefill:
         return path
     new_name = _sanitize_filename(answer)
     new_path = path.parent / f"{new_name}{path.suffix}"

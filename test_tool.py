@@ -476,7 +476,7 @@ def test_run_batch_all_urls() -> None:
     )
     sleep_calls: list[float] = []
 
-    with patch("main.Transcriber", return_value=MagicMock()), \
+    with patch("transcriber.Transcriber", return_value=MagicMock()), \
          patch("main._process_one_url", side_effect=fake_process), \
          patch("main.time.sleep", side_effect=lambda s: sleep_calls.append(s)), \
          patch("main.restore_audio_output"), \
@@ -519,7 +519,7 @@ def test_run_batch_stop_event() -> None:
         restore_to=None,
     )
 
-    with patch("main.Transcriber", return_value=MagicMock()), \
+    with patch("transcriber.Transcriber", return_value=MagicMock()), \
          patch("main._process_one_url", side_effect=fake_process), \
          patch("main.time.sleep"), \
          patch("main.restore_audio_output"), \
@@ -592,6 +592,82 @@ def test_process_one_url_navigate_and_buttons() -> None:
     check("current が後片付けされた", current["keep_alive"] is None and current["capture"] is None)
 
 
+def test_keep_active_only_mode() -> None:
+    """#19: --no-transcribe モードで Transcriber/OutputWriter/Capture が使われないこと。"""
+    print("\n[16] #19 --no-transcribe モード（keep-active専用）")
+    import argparse, threading
+    from unittest.mock import MagicMock, patch
+    from main import _keep_active_one_url, _run_keep_active_batch, build_parser
+
+    parser = build_parser()
+    ns = parser.parse_args(["--no-transcribe", "--moodle-url", "https://m.example.com/x?id=1"])
+    check("--no-transcribe フラグ存在", ns.no_transcribe is True)
+
+    args = argparse.Namespace(
+        keep_active="chrome",
+        keep_interval=20.0, save_interval=60.0,
+        segment_duration=30.0,
+    )
+    stop_event = threading.Event()
+    current: dict = {"keep_alive": None}
+
+    target_url = "https://moodle.example.com/mod/scorm/player.php?id=42"
+    save_calls: list = []
+    exit_calls: list = []
+
+    with patch("main.navigate_to_url"), \
+         patch("main.time.sleep"), \
+         patch("main.get_active_tab_url", return_value=target_url), \
+         patch("main.get_moodle_page_info", return_value=("講義42", target_url)), \
+         patch("main.WindowKeepAlive", return_value=MagicMock()), \
+         patch("main.trigger_video_play"), \
+         patch("main.get_viewing_percentage", return_value=100), \
+         patch("main.get_video_ended", return_value=True), \
+         patch("main.get_video_time", return_value=(3600.0, 3600.0)), \
+         patch("main.click_save_button", side_effect=lambda *a, **kw: save_calls.append(1)), \
+         patch("main.click_exit_activity_button", side_effect=lambda *a, **kw: exit_calls.append(1)), \
+         patch.object(stop_event, "wait", return_value=False):
+        _keep_active_one_url(target_url, 0, 1, args, stop_event, current)
+
+    check("ended検知で click_save_button が呼ばれた", len(save_calls) == 1,
+          f"calls={len(save_calls)}")
+    check("ended検知で click_exit_activity_button が呼ばれた", len(exit_calls) == 1,
+          f"calls={len(exit_calls)}")
+    check("keep_alive が後片付けされた", current["keep_alive"] is None)
+
+    urls = ["https://m.example.com/x?id=1", "https://m.example.com/x?id=2"]
+    args2 = argparse.Namespace(
+        keep_active="chrome",
+        keep_interval=20.0, save_interval=60.0,
+        segment_duration=30.0,
+    )
+    processed: list[str] = []
+    with patch("main._keep_active_one_url", side_effect=lambda u, i, t, a, s, c: processed.append(u)), \
+         patch("main.time.sleep"):
+        rc = _run_keep_active_batch(urls, args2)
+    check("_run_keep_active_batch: 全URL処理", processed == urls, f"processed={processed}")
+    check("_run_keep_active_batch: rc=0", rc == 0)
+
+
+def test_no_transcribe_requires_url() -> None:
+    """#19: --no-transcribe で URL 未指定だとエラー終了する。"""
+    print("\n[17] #19 --no-transcribe で URL 必須")
+    import argparse, io
+    from unittest.mock import patch
+    from main import run
+
+    args = argparse.Namespace(
+        no_transcribe=True,
+        moodle_url=None, urls=None, url_file=None,
+        keep_active=None,
+        list_devices=False, reset_audio=False, restore_to=None,
+        no_auto_routing=True,
+    )
+    with patch("sys.stderr", new_callable=io.StringIO):
+        rc = run(args)
+    check("--no-transcribe + URL未指定 → rc=1", rc == 1)
+
+
 def test_play_btn_pos_js_iframe_priority() -> None:
     """#13: _GET_PLAY_BTN_POS_JS が iframe 中心を最優先で返すこと（autoplay policy対策）。
 
@@ -655,6 +731,8 @@ if __name__ == "__main__":
     test_run_batch_stop_event()
     test_process_one_url_navigate_and_buttons()
     test_play_btn_pos_js_iframe_priority()
+    test_keep_active_only_mode()
+    test_no_transcribe_requires_url()
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

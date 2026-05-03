@@ -16,16 +16,35 @@ SYSTEM = platform.system()
 _original_output: str | None = None
 
 _VISIBILITY_JS = (
+    # 各 document に対し:
+    #  1) visibilityState/hidden を visible/false に上書き
+    #  2) addEventListener('visibilitychange'|'freeze'|...) を一度だけ無効化
+    #     （video.js などがタブ切替時に pause するのを防ぐ）
+    #  3) 一時停止中の <video> があれば再生を再開（throttling 対策の保険）
     "(function(d){"
     "try{Object.defineProperty(d,'visibilityState',{get:()=>'visible',configurable:true});}catch(e){}"
     "try{Object.defineProperty(d,'hidden',{get:()=>false,configurable:true});}catch(e){}"
+    "try{if(!d.__mtBlocked){d.__mtBlocked=true;"
+    "var origAdd=d.addEventListener;"
+    "d.addEventListener=function(t,l,o){"
+    "if(t==='visibilitychange'||t==='webkitvisibilitychange'||t==='freeze'||t==='blur')return;"
+    "return origAdd.call(this,t,l,o);};}}catch(e){}"
     "try{d.dispatchEvent(new Event('visibilitychange'));}catch(e){}"
+    "try{var v=d.querySelector('video');"
+    "if(v&&v.paused&&!v.ended){v.play().catch(function(){});}}catch(e){}"
     "})(document);"
     "try{for(var i=0;i<frames.length;i++){"
     "try{(function(d){"
     "Object.defineProperty(d,'visibilityState',{get:()=>'visible',configurable:true});"
     "Object.defineProperty(d,'hidden',{get:()=>false,configurable:true});"
+    "if(!d.__mtBlocked){d.__mtBlocked=true;"
+    "var origAdd=d.addEventListener;"
+    "d.addEventListener=function(t,l,o){"
+    "if(t==='visibilitychange'||t==='webkitvisibilitychange'||t==='freeze'||t==='blur')return;"
+    "return origAdd.call(this,t,l,o);};}"
     "d.dispatchEvent(new Event('visibilitychange'));"
+    "var v=d.querySelector('video');"
+    "if(v&&v.paused&&!v.ended){v.play().catch(function(){});}"
     "})(frames[i].document);}catch(e){}"
     "}}catch(e){}"
 )

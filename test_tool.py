@@ -363,7 +363,7 @@ def test_pct100_auto_stop() -> None:
     mock_transcriber.transcribe.return_value = []
 
     args = argparse.Namespace(
-        keep_active="chrome", verbose=False, timestamps=False, print_transcript=False,
+        keep_active="chrome", verbose=False, timestamps=False,
         format="txt", output=None, model="tiny", language="ja",
         segment_duration=30.0, overlap=5.0,
         keep_interval=20.0, save_interval=60.0,
@@ -385,6 +385,7 @@ def test_pct100_auto_stop() -> None:
          patch("main.get_video_time", return_value=(1800.0, 3600.0)), \
          patch("main.click_save_button"), \
          patch("main.click_exit_activity_button"), \
+         patch("main._prompt_rename", side_effect=lambda p: p), \
          patch("main.OutputWriter"):
         _process_one_url(
             "https://example.com/mod/scorm/player.php?id=42",
@@ -492,7 +493,7 @@ def test_run_batch_all_urls() -> None:
     ]
     args = argparse.Namespace(
         model="tiny", language="ja", cpu_threads=8,
-        keep_active="chrome", verbose=False, timestamps=False, print_transcript=False,
+        keep_active="chrome", verbose=False, timestamps=False,
         format="txt", output=None,
         segment_duration=30.0, overlap=5.0,
         keep_interval=20.0, save_interval=60.0,
@@ -536,7 +537,7 @@ def test_run_batch_stop_event() -> None:
     ]
     args = argparse.Namespace(
         model="tiny", language="ja", cpu_threads=8,
-        keep_active="chrome", verbose=False, timestamps=False, print_transcript=False,
+        keep_active="chrome", verbose=False, timestamps=False,
         format="txt", output=None,
         segment_duration=30.0, overlap=5.0,
         keep_interval=20.0, save_interval=60.0,
@@ -577,7 +578,7 @@ def test_process_one_url_navigate_and_buttons() -> None:
     mock_transcriber.transcribe.return_value = []
 
     args = argparse.Namespace(
-        keep_active="chrome", verbose=False, timestamps=False, print_transcript=False,
+        keep_active="chrome", verbose=False, timestamps=False,
         format="txt", output=None, model="tiny", language="ja",
         segment_duration=30.0, overlap=5.0,
         keep_interval=20.0, save_interval=60.0,
@@ -601,6 +602,7 @@ def test_process_one_url_navigate_and_buttons() -> None:
          patch("main.get_video_time", return_value=(3600.0, 3600.0)), \
          patch("main.click_save_button", side_effect=lambda *a, **kw: save_calls.append(1)), \
          patch("main.click_exit_activity_button", side_effect=lambda *a, **kw: exit_calls.append(1)), \
+         patch("main._prompt_rename", side_effect=lambda p: p), \
          patch("main.OutputWriter"):
         _process_one_url(
             target_url, 0, 2, mock_transcriber, args,

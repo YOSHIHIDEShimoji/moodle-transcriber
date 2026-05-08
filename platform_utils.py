@@ -67,13 +67,20 @@ _EXIT_ACTIVITY_JS = (
 )
 
 _GET_PCT_JS = (
+    # 1) Moodle player.php の outer page に「視聴状況 XX%」テキストがあればそれを返す
+    # 2) なければ SCORM iframe を再帰探索して video.currentTime/duration から算出
+    #    （iframe が多段ネストされた Moodle SCORM player 対応、深さ上限 4）
     "(function(){"
     "var b=document.body.innerText;"
     "var i=b.indexOf('視聴状況');"
-    "if(i<0)return '-1';"
-    "var s=b.substring(i,i+20);"
-    "var n=s.match(/(\\d+)%/);"
-    "return n?n[1]:'-1';"
+    "if(i>=0){var s=b.substring(i,i+20);var n=s.match(/(\\d+)%/);if(n)return n[1];}"
+    "function _f(w,d){if(d>4)return null;"
+    "try{var v=w.document.querySelector('video');if(v&&v.duration>0)return v;}catch(e){}"
+    "try{for(var j=0;j<w.frames.length;j++){var r=_f(w.frames[j],d+1);if(r)return r;}}catch(e){}"
+    "return null;}"
+    "var v=_f(window,0);"
+    "if(v)return Math.round(v.currentTime/v.duration*100);"
+    "return '-1';"
     "})()"
 )
 
@@ -108,19 +115,27 @@ _GET_PLAY_BTN_POS_JS = (
 )
 
 _GET_VIDEO_TIME_JS = (
+    # iframe を再帰探索（深さ上限 4）して video 要素を取得する
     "(function(){"
-    "var v=document.querySelector('video');"
-    "if(!v){for(var i=0;i<frames.length;i++){try{v=frames[i].document.querySelector('video');if(v)break;}catch(e){}}}"
-    "if(v){return v.currentTime+'|'+v.duration;}"
+    "function _f(w,d){if(d>4)return null;"
+    "try{var v=w.document.querySelector('video');if(v)return v;}catch(e){}"
+    "try{for(var i=0;i<w.frames.length;i++){var r=_f(w.frames[i],d+1);if(r)return r;}}catch(e){}"
+    "return null;}"
+    "var v=_f(window,0);"
+    "if(v)return v.currentTime+'|'+v.duration;"
     "return '-1|-1';"
     "})()"
 )
 
 _VIDEO_ENDED_JS = (
+    # iframe を再帰探索（深さ上限 4）して video.ended を返す
     "(function(){"
-    "var v=document.querySelector('video');"
-    "if(!v){for(var i=0;i<frames.length;i++){try{v=frames[i].document.querySelector('video');if(v)break;}catch(e){}}}"
-    "if(v){return v.ended?'true':'false';}"
+    "function _f(w,d){if(d>4)return null;"
+    "try{var v=w.document.querySelector('video');if(v)return v;}catch(e){}"
+    "try{for(var i=0;i<w.frames.length;i++){var r=_f(w.frames[i],d+1);if(r)return r;}}catch(e){}"
+    "return null;}"
+    "var v=_f(window,0);"
+    "if(v)return v.ended?'true':'false';"
     "return 'unknown';"
     "})()"
 )

@@ -202,11 +202,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-v", "--verbose", action="store_true", help="詳細ログを表示")
     p.add_argument(
-        "--print-transcript",
-        action="store_true",
-        help="文字起こしテキストを標準出力にリアルタイム表示（デフォルト: オフ）",
-    )
-    p.add_argument(
         "--no-transcribe",
         action="store_true",
         help="文字起こしせず Chrome タブの自動再生・視聴管理だけ行う（URL必須）",
@@ -383,9 +378,8 @@ def _process_one_url(
                 print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜")
             results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
             for r in results:
-                if args.print_transcript:
-                    prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
-                    print(f"{prefix}{r.text}")
+                prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
+                print(f"{prefix}{r.text}")
                 writer.append(r)
             pct = get_viewing_percentage(url_pattern, browser)
             ended = get_video_ended(url_pattern, browser)
@@ -405,6 +399,7 @@ def _process_one_url(
         keep_alive.stop()
         writer.finalize()
 
+    output_path = _prompt_rename(output_path)
     _title = _BGRN(page_title) if page_title else _DIM(url)
     print(f"\n  {_BGRN('✔')}  {_title}  {_BGRN('done!')}")
     print(f"  {_DIM('URL')}   {_DIM(page_url or url)}")
@@ -703,9 +698,8 @@ def run(args: argparse.Namespace) -> int:
                 print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜")
             results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
             for r in results:
-                if args.print_transcript:
-                    prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
-                    print(f"{prefix}{r.text}")
+                prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
+                print(f"{prefix}{r.text}")
                 writer.append(r)
             if args.moodle_url and args.keep_active:
                 pct = get_viewing_percentage(url_pattern, args.keep_active)

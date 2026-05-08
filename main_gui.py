@@ -1,7 +1,7 @@
 """moodle-transcriber GUI フロントエンド (PySide6 / MVP)
 
 - Basic セクション: URL リスト / Model / Format / Output / Start・Stop
-- Advanced セクション: --no-transcribe, --print-transcript, --timestamps,
+- Advanced セクション: --no-transcribe, --timestamps,
   --browser, --save-interval, --keep-interval, --no-auto-routing, --restore-to
 - 進捗バー + ログビュー
 - 完了時のリネームダイアログ
@@ -250,12 +250,10 @@ class MainWindow(QMainWindow):
         adv_layout.setSpacing(8)
 
         self.cb_no_transcribe = QCheckBox("文字起こしせず Chrome 自動再生のみ (--no-transcribe)")
-        self.cb_print_transcript = QCheckBox("文字起こしテキストを Log に表示")
         self.cb_timestamps = QCheckBox("タイムスタンプ付与 [HH:MM:SS]")
         self.cb_no_auto_routing = QCheckBox("音声ルーティングの自動切替を無効化")
 
         adv_layout.addRow(self.cb_no_transcribe)
-        adv_layout.addRow(self.cb_print_transcript)
         adv_layout.addRow(self.cb_timestamps)
         adv_layout.addRow(self.cb_no_auto_routing)
 
@@ -363,7 +361,6 @@ class MainWindow(QMainWindow):
 
         # Advanced
         args.no_transcribe = self.cb_no_transcribe.isChecked()
-        args.print_transcript = self.cb_print_transcript.isChecked()
         args.timestamps = self.cb_timestamps.isChecked()
         args.no_auto_routing = self.cb_no_auto_routing.isChecked()
         args.keep_active = self.browser_combo.currentText()

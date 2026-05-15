@@ -455,6 +455,9 @@ class WindowKeepAlive:
             self._tick_windows()
 
     def _tick_macos(self) -> None:
+        # 動画が終了済みなら visibilitychange 注入をスキップ（再生ループ防止）
+        if self._url_pattern and get_video_ended(self._url_pattern, self._browser):
+            return
         app = _MACOS_APPS.get(self._browser, self._browser)
         if self._browser in ("chrome", "arc"):
             if self._url_pattern:

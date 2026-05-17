@@ -85,7 +85,7 @@ def _fmt_progress(pct: int, cur_s: float, total_s: float) -> str:
     return f"  視聴 {bar} {pct:3d}%  [{cur} / {tot}]"
 
 
-# GUI から差し替え可能な hook（None なら CLI 既定動作）
+# 外部から差し替え可能な hook（None なら CLI 既定動作）
 _progress_hook = None  # type: ignore[var-annotated]
 _rename_hook = None  # type: ignore[var-annotated]
 
@@ -229,7 +229,6 @@ def _trigger_with_retry(url_pattern: str, browser: str, attempts: int = 5, inter
 
 
 def _prompt_rename(path: Path, timeout: int = 60) -> Path:
-    # GUI 経由のときは Qt ダイアログに委譲する
     if _rename_hook is not None:
         return _rename_hook(path)
     use_alarm = SYSTEM != "Windows" and hasattr(signal, "SIGALRM")

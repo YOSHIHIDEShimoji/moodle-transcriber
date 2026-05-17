@@ -6,47 +6,12 @@
 
 ---
 
-## 案11: リネームプロンプトのカウントダウン表示（優先度: 低・GUI アプリ化時に実装）(#10)
-
-現在の `_prompt_rename()` はカウントダウン（60, 59, 58...）を ANSI エスケープで入力行を上書きしていたため、
-ファイル名を入力できない問題があった。CLI では削除済み（SIGALRM でタイムアウトのみ）。
-GUI の TextField では残り秒数をラベル表示できるため、GUI アプリ化時に実装する。
-
----
-
 ## 案10: Chrome プロファイル自動検出（優先度: 低）(#7)
 
 - `~/Library/Application Support/Google Chrome/Local State` の JSON を読み、
   `profile.info_cache.<profile_dir>.gaia_name` / `user_name`（メールアドレス相当）を取得
 - CLI: `--chrome-profile` に `"Profile 1"` の代わりにメールアドレスや名前で指定可能
 - `--list-chrome-profiles` で一覧を表示（例: `Profile 1 → taro@example.com`）
-
----
-
-## 案9: GUI アプリ — 必須オプション最小化 + 設定プロファイル（優先度: 低・急がない）(#9)
-
-現在のCLIオプションは多く、初回利用のハードルが高い。
-
-### 方針
-
-- GUI 起動時に入力するのは Moodle URL（またはURLファイル）のみ
-- モデル・出力形式・デバイス設定などは「詳細設定」タブまたは設定ファイル（TOML/JSON）に分離
-- URLリストをアプリ内で追加・削除・並び替えできるリストビュー
-- 設定プロファイル（大学用・個人用など）の切り替え
-
----
-
-## 案8: ファイル名入力欄のプリフィル（優先度: 低・GUI アプリ化時に実装）(#8)
-
-現在の案6（ファイル名タイムアウト入力）では、入力欄は空欄から始まる。
-GUI アプリ化（案1）の際に、テキストフィールドにページタイトルから生成したファイル名を
-初期値として入力済みにしておく。
-
-### CUI での試み・断念理由
-
-ターミナルの `input()` + `readline.set_startup_hook` でプリフィルは実現できるが、
-Delete キーを押すと readline の内部バッファに積まれた文字列が一括削除されてしまい、
-ユーザー体験が悪い。GUI の TextField では自然に実現できるため、CLI では不採用とした。
 
 ---
 
@@ -186,35 +151,6 @@ def is_silent(audio: np.ndarray, threshold: float = 0.002) -> bool:
 - 視聴状況%: `get_viewing_percentage()` を30秒ごとに取得
 - 現在位置・総尺: `get_video_time()` で `video.currentTime | video.duration` をJS取得
 - シングルURL・マルチURL両モードで表示
-
----
-
-## 案1: GUI アプリ（優先度: 低・急がない）(#4)
-
-ターミナルを使わずに操作できる macOS ネイティブ GUI アプリ。
-
-### 想定 UI
-
-- URL 入力フィールド（`--moodle-url` 相当）
-- モデル選択ドロップダウン（tiny / small / medium / large-v3）
-- 出力形式選択（TXT / SRT / VTT）
-- 出力先フォルダ選択ボタン
-- 開始 / 停止ボタン
-- リアルタイム文字起こしプレビュー
-
-### 技術候補
-
-| 選択肢 | 特徴 |
-|---|---|
-| `tkinter` | Python 標準。依存追加なし。UIは素朴 |
-| `PyQt6` / `PySide6` | モダンな UI が作りやすい。要インストール |
-| `rumps` (macOS menu bar) | メニューバーアプリとして常駐。軽量 |
-| Swift / SwiftUI | ネイティブ最高品質。Python との連携が必要 |
-
-### 実装メモ
-
-- `main.py` の `run()` をそのまま `threading.Thread` で呼び出せる設計になっているため GUI 化しやすい
-- 文字起こし結果は `OutputWriter` を wrap して GUI にストリーム表示できる
 
 ---
 

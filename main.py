@@ -134,9 +134,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-f", "--format", choices=["txt", "srt", "vtt"], default="txt", help="出力フォーマット")
     p.add_argument(
         "-m", "--model",
-        choices=["tiny", "base", "small", "medium", "large-v3"],
-        default="large-v3",
-        help="Whisperモデルサイズ（デフォルト: large-v3）",
+        choices=["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"],
+        default="large-v3-turbo",
+        help="Whisperモデルサイズ（デフォルト: large-v3-turbo）",
     )
     p.add_argument("-l", "--language", default="ja", help="文字起こし言語 ISO 639-1（デフォルト: ja）")
     p.add_argument("-d", "--device", type=int, default=None, help="入力デバイスインデックス（デフォルト: 自動検出）")

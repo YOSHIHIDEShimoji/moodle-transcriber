@@ -22,6 +22,7 @@ class OutputWriter:
         language: str,
         title: str | None = None,
         page_url: str | None = None,
+        backend: str | None = None,
     ):
         self._path = output_path
         self._fmt = fmt
@@ -34,7 +35,8 @@ class OutputWriter:
             self._file.write(f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             if page_url:
                 self._file.write(f"# URL: {page_url}\n")
-            self._file.write(f"# Model: {model_size} (int8) | Language: {language}\n")
+            backend_s = f" | Backend: {backend}" if backend else ""
+            self._file.write(f"# Model: {model_size}{backend_s} | Language: {language}\n")
             self._file.write(f"# {'─' * 50}\n\n")
         elif fmt == OutputFormat.VTT:
             self._file.write("WEBVTT\n\n")

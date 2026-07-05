@@ -12,17 +12,23 @@ import time
 
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 from urllib.parse import parse_qs, urlparse
+
+import numpy as np
 
 from capture import create_capture, find_loopback_device, list_all_devices
 from output import OutputFormat, OutputWriter, _fmt_ts
 from platform_utils import (
+    TabTarget,
     WindowKeepAlive,
     click_exit_activity_button,
     click_save_button,
+    get_active_tab_id,
     get_active_tab_url,
     get_moodle_page_info,
+    get_tab_id_by_pattern,
+    get_tab_url,
     get_video_ended,
     get_video_time,
     get_viewing_percentage,
@@ -30,7 +36,9 @@ from platform_utils import (
     restore_audio_output,
     setup_audio_for_capture,
     trigger_video_play,
+    wait_for_page_ready,
 )
+from transcriber import is_silent
 
 # faster-whisper のロードを遅延させるため Transcriber は使う直前に import する。
 # --no-transcribe 時はモデル読み込みコスト（数百MB）を避けたい。
@@ -215,10 +223,10 @@ def _sanitize_filename(name: str) -> str:
     return name[:80]
 
 
-def _trigger_with_retry(url_pattern: str, browser: str, attempts: int = 5, interval: float = 3.0) -> None:
+def _trigger_with_retry(target: "TabTarget", browser: str, attempts: int = 5, interval: float = 3.0) -> None:
     """動画再生を試みる。SCORMプレーヤーの初期化待ちのためリトライする。"""
     for i in range(attempts):
-        if trigger_video_play(url_pattern, browser):
+        if trigger_video_play(target, browser):
             logger.info("video play triggered (attempt %d)", i + 1)
             return
         logger.warning("trigger_video_play: no_video (attempt %d/%d)", i + 1, attempts)
@@ -290,15 +298,159 @@ def _unique_path(path: Path) -> Path:
 
 
 def _url_to_pattern(url: str) -> str:
-    """Full URL からタブ検索に使う一意パターンを抽出する。"""
+    """Full URL からタブ検索に使う一意パターンを抽出する。
+
+    可能なら "player.php?a=123" のようにパス付きで返し、
+    "a=123" が無関係なタブの URL（scoid=1230 等）に部分一致する事故を減らす。
+    """
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
     if "id" in qs:
-        return f"id={qs['id'][0]}"
+        cand = f"view.php?id={qs['id'][0]}"
+        return cand if cand in url else f"id={qs['id'][0]}"
     # SCORM player URL: player.php?a=XXXXX (リダイレクト後)
     if "a" in qs:
-        return f"a={qs['a'][0]}"
+        cand = f"player.php?a={qs['a'][0]}"
+        return cand if cand in url else f"a={qs['a'][0]}"
     return parsed.netloc + parsed.path
+
+
+def _resolve_tab_target(url: str, browser: str) -> tuple["TabTarget", str, str]:
+    """navigate 直後に呼び、追跡すべきタブと実 URL を解決する。
+
+    Returns: (target, url_pattern, actual_url)
+    - タブ id が取れればそれを target にする（ユーザーがタブを切り替えても誤爆しない）
+    - リダイレクト完了は固定 sleep でなくポーリングで待つ
+    """
+    tab_id = get_active_tab_id(browser)
+    actual_url = wait_for_page_ready(tab_id, browser) or url
+    url_pattern = _url_to_pattern(actual_url)
+    target: TabTarget = tab_id if tab_id is not None else url_pattern
+    logger.info("target resolved: tab_id=%s pattern=%r (actual_url: %r)",
+                tab_id, url_pattern, actual_url)
+    return target, url_pattern, actual_url
+
+
+class PlaybackMonitor:
+    """動画終了の判定器。video.ended を一次シグナルに、取得不能でも止まれる
+    フォールバック（currentTime 停滞 / pct=100 / 無音継続 / 総尺超過）を重ねる。
+
+    背景: SCORM 教材の iframe 構成によっては JS から video 要素に到達できず、
+    ended/pct が一切取れない（ログ上 pct=-1 ended=None が延々と続く）。
+    従来はその場合に永遠に止まらなかった。
+    """
+
+    STALL_POLLS = 4          # currentTime が動かない連続 poll 数 → 終了扱い
+    NEAR_END_POLLS = 2       # currentTime が総尺付近で停滞する連続 poll 数
+    PCT100_POLLS = 3         # 視聴状況 100% の連続 poll 数
+    SILENCE_AFTER_AUDIO = 6  # 音が出た後の無音セグメント数 → 終了扱い（約3分）
+    SILENCE_RETRIGGER = 4    # 一度も音が出ないとき再生リトライを打つ無音数（約2分）
+    SILENCE_NO_AUDIO = 12    # 一度も音が出ないまま諦めるまでの無音数（約6分）
+    BLIND_WARN_POLLS = 10    # 全シグナル不能の警告を出すまでの poll 数
+
+    def __init__(
+        self,
+        target: "TabTarget",
+        browser: str,
+        retrigger: "Callable[[], None] | None" = None,
+    ):
+        self._target = target
+        self._browser = browser
+        self._retrigger = retrigger
+        self._last_cur = -1.0
+        self._stall = 0
+        self._near_end = 0
+        self._pct100 = 0
+        self._silent_run = 0
+        self._heard_audio = False
+        self._retriggered = False
+        self._blind = 0
+        self._blind_warned = False
+
+    def poll(self, silent: bool | None = None, elapsed: float | None = None) -> tuple[bool, str]:
+        """1 セグメント（または poll_interval）ごとに呼ぶ。
+
+        Returns: (終了すべきか, 理由)
+        """
+        pct = get_viewing_percentage(self._target, self._browser)
+        ended = get_video_ended(self._target, self._browser)
+        cur, total = get_video_time(self._target, self._browser)
+        logger.debug("poll: pct=%d ended=%s cur=%.1f total=%.1f silent=%s elapsed=%s",
+                     pct, ended, cur, total, silent, elapsed)
+
+        # 進捗表示（pct が取れなければ currentTime/duration から算出）
+        disp_pct = pct
+        if disp_pct < 0 and cur >= 0 and total > 0:
+            disp_pct = round(cur / total * 100)
+        if disp_pct >= 0:
+            _print_progress(disp_pct, cur, total)
+
+        # ── 一次シグナル: video.ended ────────────────────────────────
+        if ended is True:
+            return True, "video.ended"
+
+        # ── フォールバック1: currentTime が総尺付近で停滞 ─────────────
+        if cur >= 0 and total > 0 and cur >= total - 1.5:
+            self._near_end += 1
+            if self._near_end >= self.NEAR_END_POLLS:
+                return True, "動画末尾に到達"
+        else:
+            self._near_end = 0
+
+        # ── フォールバック2: currentTime の停滞（再生が止まったまま）──
+        if cur >= 0:
+            if self._last_cur >= 0 and abs(cur - self._last_cur) < 0.5:
+                self._stall += 1
+            else:
+                self._stall = 0
+            self._last_cur = cur
+            if self._stall >= self.STALL_POLLS:
+                return True, "再生停止（currentTime 停滞）"
+
+        # ── フォールバック3: 視聴状況 100% が継続 ─────────────────────
+        if pct >= 100:
+            self._pct100 += 1
+            if self._pct100 >= self.PCT100_POLLS:
+                return True, "視聴状況 100%"
+        else:
+            self._pct100 = 0
+
+        # ── フォールバック4: 無音の継続（文字起こしモードのみ）────────
+        if silent is not None:
+            if silent:
+                self._silent_run += 1
+                if self._heard_audio:
+                    if self._silent_run >= self.SILENCE_AFTER_AUDIO:
+                        return True, "無音継続（音声終了とみなす）"
+                else:
+                    if (self._silent_run == self.SILENCE_RETRIGGER
+                            and not self._retriggered and self._retrigger):
+                        print("\n  警告: 音声が検出されません。再生を再試行します...")
+                        logger.warning("no audio yet — retriggering playback")
+                        self._retriggered = True
+                        self._retrigger()
+                    if self._silent_run >= self.SILENCE_NO_AUDIO:
+                        return True, "音声が検出できないため中止"
+            else:
+                self._heard_audio = True
+                self._silent_run = 0
+
+        # ── フォールバック5: 総尺超過ウォッチドッグ ───────────────────
+        if elapsed is not None and total > 0 and elapsed > total * 1.5 + 120:
+            return True, "録音時間が総尺を大幅超過（watchdog）"
+
+        # ── 全シグナル不能の警告（keep-active モード等）───────────────
+        if pct < 0 and ended is None and cur < 0:
+            self._blind += 1
+            if self._blind >= self.BLIND_WARN_POLLS and not self._blind_warned:
+                self._blind_warned = True
+                print("\n  警告: 動画の進捗・終了を検出できません（SCORM 構成が非対応）。"
+                      "終了検出は無音判定などに依存します。")
+                logger.warning("playback signals unavailable (blind mode)")
+        else:
+            self._blind = 0
+
+        return False, ""
 
 
 def _collect_urls(args: argparse.Namespace) -> list[str]:
@@ -327,17 +479,15 @@ def _process_one_url(
 
     print(f"\n{_BOLD(f'[{idx+1}/{total}]')} {_CYN(url)}")
 
+    # 動画（URL）ごとに重複除去カーソルをリセットする。
+    # しないと 2 本目以降の冒頭が前の動画との「重複」と誤判定され丸ごと欠落する。
+    transcriber.reset()
+
     navigate_to_url(url, browser)
     print("  ページ読み込み中...")
-    time.sleep(6)
+    target, url_pattern, actual_url = _resolve_tab_target(url, browser)
 
-    # navigate_to_url はアクティブタブを遷移させる。SCORM player へのリダイレクト後、
-    # アクティブタブの実URLを取得してパターンを解決する（view.php?id= → player.php?a=）。
-    actual_url = get_active_tab_url(browser) or url
-    url_pattern = _url_to_pattern(actual_url)
-    logger.info("url_pattern resolved: %r (actual_url: %r)", url_pattern, actual_url)
-
-    page_title, page_url = get_moodle_page_info(url_pattern, browser)
+    page_title, page_url = get_moodle_page_info(target, browser)
 
     fmt = OutputFormat(args.format)
     now = datetime.now()
@@ -354,11 +504,12 @@ def _process_one_url(
     _print_session_info(info_rows)
 
     writer = OutputWriter(output_path, fmt, args.model, args.language,
-                          title=page_title, page_url=page_url or url)
+                          title=page_title, page_url=page_url or url,
+                          backend=getattr(transcriber, "backend_desc", None))
     capture = create_capture(device_index, args.segment_duration, args.overlap)
     keep_alive = WindowKeepAlive(
         browser, args.keep_interval,
-        url_pattern=url_pattern,
+        target=target,
         save_interval=args.save_interval,
     )
     current["keep_alive"] = keep_alive
@@ -367,38 +518,45 @@ def _process_one_url(
     print(f"\n{_BGRN('▶  録音開始')}  {_DIM('Ctrl+C で全停止')}\n")
     capture.start()
     keep_alive.start()
-    _trigger_with_retry(url_pattern, browser)
+    _trigger_with_retry(target, browser)
 
+    monitor = PlaybackMonitor(target, browser,
+                              retrigger=lambda: _trigger_with_retry(target, browser))
     try:
         for segment in capture.segments():
             if stop_event.is_set():
                 break
+            silent = is_silent(segment.data)
             if args.verbose:
-                print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜")
-            results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
-            for r in results:
-                prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
-                print(f"{prefix}{r.text}")
-                writer.append(r)
-            pct = get_viewing_percentage(url_pattern, browser)
-            ended = get_video_ended(url_pattern, browser)
-            logger.debug("segment %d: pct=%d ended=%s", segment.segment_id, pct, ended)
-            if pct >= 0:
-                cur_s, total_s = get_video_time(url_pattern, browser)
-                _print_progress(pct, cur_s, total_s)
-            if ended:
-                print(f"\n{_BGRN('視聴完了')} — 保存中...")
-                logger.info("video ended: pct=%d", pct)
-                click_save_button(url_pattern, browser)
+                print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜"
+                      + (" (無音スキップ)" if silent else ""))
+            if not silent:
+                results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
+                for r in results:
+                    prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
+                    print(f"{prefix}{r.text}")
+                    writer.append(r)
+            elapsed = segment.start_time + len(segment.data) / 16000.0
+            should_stop, reason = monitor.poll(silent=silent, elapsed=elapsed)
+            if should_stop:
+                print(f"\n{_BGRN('視聴完了')} ({reason}) — 保存中...")
+                logger.info("stopping: %s", reason)
+                # 先に keep-alive を止める（join 込み）。止めずに保存→離脱すると
+                # 残った tick が play() を注入して動画を再開させることがある。
+                keep_alive.mark_ended()
+                keep_alive.stop()
+                click_save_button(target, browser)
                 time.sleep(1)
-                click_exit_activity_button(url_pattern, browser)
+                click_exit_activity_button(target, browser)
                 capture.stop()
                 break
     finally:
         keep_alive.stop()
+        capture.stop()   # 冪等。例外経路でもストリームを確実に閉じる
         writer.finalize()
 
-    output_path = _prompt_rename(output_path)
+    if not stop_event.is_set():
+        output_path = _prompt_rename(output_path)
     _title = _BGRN(page_title) if page_title else _DIM(url)
     print(f"\n  {_BGRN('✔')}  {_title}  {_BGRN('done!')}")
     print(f"  {_DIM('URL')}   {_DIM(page_url or url)}")
@@ -424,13 +582,9 @@ def _keep_active_one_url(
 
     navigate_to_url(url, browser)
     print("  ページ読み込み中...")
-    time.sleep(6)
+    target, url_pattern, actual_url = _resolve_tab_target(url, browser)
 
-    actual_url = get_active_tab_url(browser) or url
-    url_pattern = _url_to_pattern(actual_url)
-    logger.info("keep-active url_pattern resolved: %r (actual_url: %r)", url_pattern, actual_url)
-
-    page_title, page_url = get_moodle_page_info(url_pattern, browser)
+    page_title, page_url = get_moodle_page_info(target, browser)
     info_rows: list[tuple[str, str]] = []
     if page_title:
         info_rows.append(("ページ", _GRN(page_title)))
@@ -439,32 +593,31 @@ def _keep_active_one_url(
 
     keep_alive = WindowKeepAlive(
         browser, args.keep_interval,
-        url_pattern=url_pattern,
+        target=target,
         save_interval=args.save_interval,
     )
     current["keep_alive"] = keep_alive
 
     print(f"\n{_BGRN('▶  再生開始')}  {_DIM('Ctrl+C で全停止')}\n")
     keep_alive.start()
-    _trigger_with_retry(url_pattern, browser)
+    _trigger_with_retry(target, browser)
 
     poll_interval = max(5.0, args.segment_duration / 2)
+    monitor = PlaybackMonitor(target, browser)
+    start_t = time.monotonic()
     try:
         while not stop_event.is_set():
             if stop_event.wait(poll_interval):
                 break
-            pct = get_viewing_percentage(url_pattern, browser)
-            ended = get_video_ended(url_pattern, browser)
-            logger.debug("keep-active poll: pct=%d ended=%s", pct, ended)
-            if pct >= 0:
-                cur_s, total_s = get_video_time(url_pattern, browser)
-                _print_progress(pct, cur_s, total_s)
-            if ended:
-                print(f"\n{_BGRN('視聴完了')} — 保存中...")
-                logger.info("keep-active video ended: pct=%d", pct)
-                click_save_button(url_pattern, browser)
+            should_stop, reason = monitor.poll(elapsed=time.monotonic() - start_t)
+            if should_stop:
+                print(f"\n{_BGRN('視聴完了')} ({reason}) — 保存中...")
+                logger.info("keep-active stopping: %s", reason)
+                keep_alive.mark_ended()
+                keep_alive.stop()
+                click_save_button(target, browser)
                 time.sleep(1)
-                click_exit_activity_button(url_pattern, browser)
+                click_exit_activity_button(target, browser)
                 break
     finally:
         keep_alive.stop()
@@ -545,6 +698,8 @@ def _run_batch(
                 print(f"\n  次の URL まで {_DIM('5秒待機...')}")
                 time.sleep(5)
     finally:
+        if hasattr(transcriber, "close"):
+            transcriber.close()
         if routing_changed:
             restore_audio_output(restore_to=args.restore_to)
 
@@ -619,20 +774,27 @@ def run(args: argparse.Namespace) -> int:
     if urls:
         return _run_batch(urls, args, device_index, device_name, routing_changed)
 
-    # ─── 以下、シングル URL モード（既存の動作） ─────────────────────────────
+    # ─── 以下、シングル URL モード(既存の動作) ─────────────────────────────
 
-    # SCORM player の view.php→player.php?a= リダイレクト後の実 URL を解決し、
-    # url_pattern を AppleScript の URL contains 検索に使う。
+    # ユーザーが開いている Moodle タブをパターンで探し、見つかればタブ id で追跡する
+    # （アクティブタブ依存だと、実行中のタブ切り替えで別ページを誤って掴む）。
     url_pattern = args.moodle_url or ""
+    target: TabTarget = url_pattern
     if args.moodle_url and args.keep_active:
-        actual_url = get_active_tab_url(args.keep_active) or args.moodle_url
+        tab_id = get_tab_id_by_pattern(args.moodle_url, args.keep_active)
+        if tab_id is not None:
+            actual_url = get_tab_url(tab_id, args.keep_active) or args.moodle_url
+        else:
+            actual_url = get_active_tab_url(args.keep_active) or args.moodle_url
         url_pattern = _url_to_pattern(actual_url)
-        logger.info("single url_pattern resolved: %r (actual_url: %r)", url_pattern, actual_url)
+        target = tab_id if tab_id is not None else url_pattern
+        logger.info("single target resolved: tab_id=%s pattern=%r (actual_url: %r)",
+                    tab_id, url_pattern, actual_url)
 
-    # ページ情報取得（Chrome タブの DOM から読む、サーバーリクエストなし）
+    # ページ情報取得(Chrome タブの DOM から読む、サーバーリクエストなし)
     page_title, page_url = None, None
     if args.moodle_url and args.keep_active:
-        page_title, page_url = get_moodle_page_info(url_pattern, args.keep_active)
+        page_title, page_url = get_moodle_page_info(target, args.keep_active)
 
     fmt = OutputFormat(args.format)
     now = datetime.now()
@@ -647,7 +809,7 @@ def run(args: argparse.Namespace) -> int:
         info_rows.append(("ページ", _GRN(page_title)))
     info_rows.append(("デバイス", _CYN(f"[{device_index}] {device_name}")))
     info_rows.append(("出力", _CYN(str(output_path))))
-    info_rows.append(("モデル", _BLU(f"{args.model} (int8) | {args.language}")))
+    info_rows.append(("モデル", _BLU(f"{args.model} | {args.language}")))
     _print_session_info(info_rows)
 
     print(_YLW("  音量 0 でも BlackHole 録音は継続します"))
@@ -660,14 +822,15 @@ def run(args: argparse.Namespace) -> int:
         cpu_threads=args.cpu_threads,
     )
     writer = OutputWriter(output_path, fmt, args.model, args.language,
-                          title=page_title, page_url=page_url)
+                          title=page_title, page_url=page_url,
+                          backend=getattr(transcriber, "backend_desc", None))
     capture = create_capture(device_index, args.segment_duration, args.overlap)
 
     keep_alive: WindowKeepAlive | None = None
     if args.keep_active:
         keep_alive = WindowKeepAlive(
             args.keep_active, args.keep_interval,
-            url_pattern=url_pattern,
+            target=target,
             save_interval=args.save_interval,
         )
 
@@ -689,39 +852,49 @@ def run(args: argparse.Namespace) -> int:
     if keep_alive:
         keep_alive.start()
     if args.moodle_url and args.keep_active:
-        _trigger_with_retry(url_pattern, args.keep_active)
+        _trigger_with_retry(target, args.keep_active)
 
+    monitor: PlaybackMonitor | None = None
+    if args.moodle_url and args.keep_active:
+        monitor = PlaybackMonitor(target, args.keep_active,
+                                  retrigger=lambda: _trigger_with_retry(target, args.keep_active))
     try:
         for segment in capture.segments():
+            silent = is_silent(segment.data)
             if args.verbose:
-                print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜")
-            results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
-            for r in results:
-                prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
-                print(f"{prefix}{r.text}")
-                writer.append(r)
-            if args.moodle_url and args.keep_active:
-                pct = get_viewing_percentage(url_pattern, args.keep_active)
-                ended = get_video_ended(url_pattern, args.keep_active)
-                logger.debug("segment %d: pct=%d ended=%s", segment.segment_id, pct, ended)
-                if pct >= 0:
-                    cur_s, total_s = get_video_time(url_pattern, args.keep_active)
-                    _print_progress(pct, cur_s, total_s)
-                if ended:
-                    print(f"\n{_BGRN('視聴完了')} — 保存中...")
-                    logger.info("single url video ended: pct=%d", pct)
+                print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜"
+                      + (" (無音スキップ)" if silent else ""))
+            if not silent:
+                results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
+                for r in results:
+                    prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
+                    print(f"{prefix}{r.text}")
+                    writer.append(r)
+            if monitor is not None:
+                elapsed = segment.start_time + len(segment.data) / 16000.0
+                should_stop, reason = monitor.poll(silent=silent, elapsed=elapsed)
+                if should_stop:
+                    print(f"\n{_BGRN('視聴完了')} ({reason}) — 保存中...")
+                    logger.info("single url stopping: %s", reason)
                     if keep_alive:
+                        keep_alive.mark_ended()
                         keep_alive.stop()
-                    click_save_button(url_pattern, args.keep_active)
+                    click_save_button(target, args.keep_active)
                     time.sleep(1)
-                    click_exit_activity_button(url_pattern, args.keep_active)
+                    click_exit_activity_button(target, args.keep_active)
                     capture.stop()
                     break
     finally:
+        if keep_alive:
+            keep_alive.stop()
+        capture.stop()   # 冪等。例外経路でもストリームを確実に閉じる
         writer.finalize()
+        if hasattr(transcriber, "close"):
+            transcriber.close()
         if routing_changed:
             restore_audio_output(restore_to=args.restore_to)
-        output_path = _prompt_rename(output_path)
+        if not shutdown_requested:
+            output_path = _prompt_rename(output_path)
         _title = _BGRN(page_title) if page_title else ""
         print(f"\n  {_BGRN('✔')}  {(_title + '  ') if _title else ''}{_BGRN('done!')}")
         if page_url:

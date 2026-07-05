@@ -44,6 +44,34 @@ pyenv local moodle-transcriber-3.11.9
 pip install -r requirements.txt
 ```
 
+### 5. whisper.cpp（macOS の文字起こしバックエンド）
+
+macOS では [whisper.cpp](https://github.com/ggml-org/whisper.cpp)（Metal + CoreML）を使う。
+デフォルトの場所は `~/my-projects/whisper.cpp`。別の場所にある場合は環境変数で指定する:
+
+```bash
+export WHISPER_CPP_DIR=/path/to/whisper.cpp
+```
+
+必要なもの:
+- `build/bin/whisper-server`（推奨。起動時に常駐させ、セグメントごとのモデル再ロードを回避）
+- `build/bin/whisper-cli`（whisper-server が無い場合のフォールバック）
+- `models/ggml-<model>.bin`（例: `ggml-large-v3-turbo.bin`）
+
+---
+
+## 動作メモ（安定性まわり）
+
+- **終了判定**: `video.ended` が取れない SCORM 教材でも、
+  「currentTime 停滞 / 視聴状況100% / 無音の継続 / 総尺超過」のフォールバックで自動停止する。
+  終了理由は `視聴完了 (理由)` の形で表示される。
+- **無音スキップ**: 無音セグメントは Whisper に渡さない
+  （無音入力による「ご視聴ありがとうございました」等の幻覚を防止）。
+  録音開始直後に音が来ない場合は再生を1回自動リトライし、それでも無音なら中止する。
+- **タブ追跡**: 処理対象タブは URL パターンではなくタブ id で追跡するため、
+  実行中に別タブ・別ウィンドウで作業しても誤爆しない
+  （ただし対象タブ自体を閉じたり URL を変えたりしないこと）。
+
 ---
 
 ## 基本的な使い方

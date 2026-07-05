@@ -5,7 +5,9 @@ sounddevice==0.5.5; sys_platform != "win32"
 pyaudiowpatch>=0.2.12; sys_platform == "win32"
 
 numpy>=1.24,<2.0
-mlx-whisper>=0.4.3; sys_platform == "darwin"
+# macOS は whisper.cpp (whisper-server/whisper-cli) を外部プロセスとして使用。
+# requests は常駐 whisper-server への HTTP リクエスト用。
+requests>=2.31; sys_platform == "darwin"
 faster-whisper==1.2.1; sys_platform != "darwin"
 scipy>=1.11
 tqdm>=4.66

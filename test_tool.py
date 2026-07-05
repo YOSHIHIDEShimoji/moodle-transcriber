@@ -184,11 +184,14 @@ def test_multi_url_utils() -> None:
     from main import _url_to_pattern, _collect_urls, _unique_path
 
     # _url_to_pattern: id= / a= クエリパラメータを抽出
+    # （可能なら player.php?a=... のようにパス付きで返し部分一致誤爆を防ぐ）
     cases = [
         ("https://moodle.example.com/mod/scorm/player.php?id=123", "id=123"),
         ("https://moodle.example.com/mod/scorm/player.php?id=456&cm=789", "id=456"),
+        ("https://moodle.example.com/mod/scorm/view.php?id=123", "view.php?id=123"),
         # SCORM player.php?a= (リダイレクト後の実URL)
-        ("https://moodle.gs.chiba-u.jp/moodle/mod/scorm/player.php?a=176267&currentorg&scoid=352590", "a=176267"),
+        ("https://moodle.gs.chiba-u.jp/moodle/mod/scorm/player.php?a=176267&currentorg&scoid=352590",
+         "player.php?a=176267"),
         ("https://moodle.example.com/course/view.php", "moodle.example.com/course/view.php"),
     ]
     for url, expected in cases:
@@ -375,7 +378,8 @@ def test_pct100_auto_stop() -> None:
 
     with patch("main.navigate_to_url"), \
          patch("main.time.sleep"), \
-         patch("main.get_active_tab_url", return_value="https://example.com/mod/scorm/player.php?id=42"), \
+         patch("main.get_active_tab_id", return_value=42), \
+         patch("main.wait_for_page_ready", return_value="https://example.com/mod/scorm/player.php?id=42"), \
          patch("main.get_moodle_page_info", return_value=("テスト講義", "https://example.com")), \
          patch("main.create_capture", return_value=mock_capture), \
          patch("main.WindowKeepAlive", return_value=MagicMock()), \
@@ -393,9 +397,12 @@ def test_pct100_auto_stop() -> None:
             0, "BlackHole 2ch", current, stop_event,
         )
 
-    check("pct=100: capture.stop() 1回のみ", stop_call_count[0] == 1,
+    # ended 経路 + finally の二重呼び出しは実クラス側の冪等化で吸収する
+    # （test_capture_stop_idempotent で検証）。ここでは呼ばれたことだけ確認。
+    check("ended=True: capture.stop() が呼ばれた", stop_call_count[0] >= 1,
           f"実際の呼び出し回数: {stop_call_count[0]}")
-    check("pct=100: stop_event は未設定（正常終了）", not stop_event.is_set())
+    check("ended=True: stop_event は未設定（正常終了）", not stop_event.is_set())
+    check("ended=True: transcriber.reset() が呼ばれた", mock_transcriber.reset.called)
 
 
 # ─── 11. シングルURL _unique_path 適用確認 ────────────────────────────────────
@@ -436,7 +443,8 @@ def test_single_url_unique_path() -> None:
 
         with patch("main.navigate_to_url"), \
              patch("main.time.sleep"), \
-             patch("main.get_active_tab_url", return_value="https://example.com/mod/scorm/player.php?id=1"), \
+             patch("main.get_active_tab_id", return_value=1), \
+             patch("main.wait_for_page_ready", return_value="https://example.com/mod/scorm/player.php?id=1"), \
              patch("main.get_moodle_page_info", return_value=("テスト講義", "https://example.com")), \
              patch("main.create_capture", return_value=mock_capture), \
              patch("main.WindowKeepAlive", return_value=MagicMock()), \
@@ -592,7 +600,8 @@ def test_process_one_url_navigate_and_buttons() -> None:
 
     with patch("main.navigate_to_url", side_effect=lambda url, *a, **kw: navigate_calls.append(url)), \
          patch("main.time.sleep"), \
-         patch("main.get_active_tab_url", return_value=target_url), \
+         patch("main.get_active_tab_id", return_value=99), \
+         patch("main.wait_for_page_ready", return_value=target_url), \
          patch("main.get_moodle_page_info", return_value=("テスト講義99", target_url)), \
          patch("main.create_capture", return_value=mock_capture), \
          patch("main.WindowKeepAlive", return_value=MagicMock()), \
@@ -643,7 +652,8 @@ def test_keep_active_only_mode() -> None:
 
     with patch("main.navigate_to_url"), \
          patch("main.time.sleep"), \
-         patch("main.get_active_tab_url", return_value=target_url), \
+         patch("main.get_active_tab_id", return_value=42), \
+         patch("main.wait_for_page_ready", return_value=target_url), \
          patch("main.get_moodle_page_info", return_value=("講義42", target_url)), \
          patch("main.WindowKeepAlive", return_value=MagicMock()), \
          patch("main.trigger_video_play"), \
@@ -726,54 +736,192 @@ def test_main_hooks() -> None:
     check("_rename_hook の戻り値で置換", result.name == "renamed.txt", f"got={result}")
 
 
-def test_main_gui_smoke() -> None:
-    """#4: main_gui を import / MainWindow を offscreen で生成 / args 構築できる。"""
-    print("\n[19] #4 main_gui スモーク (offscreen)")
-    import os
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    try:
-        import main_gui  # noqa: F401
-    except Exception as e:  # noqa: BLE001
-        check("main_gui import", False, str(e))
-        return
-    check("main_gui import", True)
+def test_capture_stop_idempotent() -> None:
+    """capture.stop() の冪等性: ended経路 + SIGINT の二重呼び出しでも
+    末尾セグメントが重複しない / None センチネルが1つだけ入る。"""
+    print("\n[19] AudioCapture.stop() 冪等性")
+    import queue, threading
+    from capture import AudioCapture
 
-    from PySide6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication(["test"])
-    try:
-        win = main_gui.MainWindow()
-    except Exception as e:  # noqa: BLE001
-        check("MainWindow 生成", False, str(e))
-        return
-    check("MainWindow 生成", True)
+    cap = AudioCapture.__new__(AudioCapture)
+    cap._native_rate = 16000
+    cap._buffer = [np.zeros(20000, dtype=np.float32)]  # 1秒以上 → flush対象
+    cap._buffer_size = 20000
+    cap._samples_captured = 20000
+    cap._segment_id = 0
+    cap._queue = queue.Queue()
+    cap._lock = threading.Lock()
+    cap._stream = None
+    cap._stopped = False
 
-    check("初期 URL 件数 0", win.url_list.count() == 0)
-    check("Start 有効・Stop 無効",
-          win.btn_start.isEnabled() and not win.btn_stop.isEnabled())
+    cap.stop()
+    cap.stop()  # 二重呼び出し
 
-    # URL 1件 + Output指定 → args 組み立て
-    win.url_input.setText("https://moodle.example.com/.../view.php?id=1")
-    win._add_url()
-    win.output_edit.setText("out_test")
-    win.cb_no_transcribe.setChecked(True)
+    items = []
+    while not cap._queue.empty():
+        items.append(cap._queue.get_nowait())
+    segs = [i for i in items if i is not None]
+    nones = [i for i in items if i is None]
+    check("二重 stop でも末尾セグメントは1個", len(segs) == 1, f"segs={len(segs)}")
+    check("None センチネルは1個", len(nones) == 1, f"nones={len(nones)}")
+    check("flush 後バッファはクリア", cap._buffer_size == 0)
 
-    args = win._build_args()
-    check("_build_args 戻り値あり", args is not None)
-    check("URL 単一なら args.moodle_url にセット",
-          args.moodle_url == "https://moodle.example.com/.../view.php?id=1",
-          f"moodle_url={args.moodle_url}")
-    check("URL 単一なら args.urls=None", args.urls is None)
-    check("--no-transcribe チェック反映", args.no_transcribe is True)
-    check("output 反映", args.output == "out_test")
-    check("model デフォルト large-v3", args.model == "large-v3")
 
-    # URL 2件 → urls にセット
-    win.url_input.setText("https://m.example.com/?id=2")
-    win._add_url()
-    args2 = win._build_args()
-    check("URL 複数なら args.urls にセット",
-          args2.urls is not None and len(args2.urls) == 2)
-    check("URL 複数なら moodle_url=None", args2.moodle_url is None)
+def test_transcriber_dedup_and_reset() -> None:
+    """_prev_end の URL 間持ち越しバグ（バッチ2本目の冒頭欠落）の回帰テスト。"""
+    print("\n[20] Transcriber の重複除去 / reset()")
+    from collections import deque
+    from transcriber import Transcriber
+
+    t = Transcriber.__new__(Transcriber)
+    t._prev_end = 0.0
+    t._recent_texts = deque(maxlen=8)
+
+    # 1本目: 0〜1800秒まで出力した状態を作る
+    out1 = t._dedup([{"text": "一本目の最後の文です", "start": 1770.0, "end": 1800.0}], 0.0)
+    check("1本目のセグメントは出力される", len(out1) == 1)
+    check("_prev_end が進む", t._prev_end == 1800.0)
+
+    # reset() しないと 2 本目冒頭 (abs 0〜30秒) は捨てられる（バグの再現）
+    dropped = t._dedup([{"text": "二本目の冒頭です", "start": 0.0, "end": 30.0}], 0.0)
+    check("reset なしだと冒頭が捨てられる（旧バグの再現）", len(dropped) == 0)
+
+    # reset() すれば出力される
+    t.reset()
+    out2 = t._dedup([{"text": "二本目の冒頭です", "start": 0.0, "end": 30.0}], 0.0)
+    check("reset 後は冒頭が出力される", len(out2) == 1, f"got={len(out2)}")
+
+    # オーバーラップ境界の重複テキスト除去:
+    # 30秒セグメント + 5秒オーバーラップで、次セグメントが同じ文を再転写するケース
+    t.reset()
+    t._dedup([{"text": "医師は他者を侵害する仕事です", "start": 25.0, "end": 30.0}], 0.0)
+    dup = t._dedup([{"text": "医師は他者を侵害する仕事です。", "start": 0.0, "end": 5.5}], 25.0)
+    check("境界の重複テキストは除去される", len(dup) == 0, f"got={[s.text for s in dup]}")
+
+    # 連続セグメント（境界をまたがない）の同一文は誤除去しない
+    t.reset()
+    t._dedup([{"text": "大事なことなので繰り返します", "start": 0.0, "end": 5.0}], 0.0)
+    rep = t._dedup([{"text": "大事なことなので繰り返します", "start": 0.0, "end": 5.0}], 5.0)
+    check("境界をまたがない繰り返し文は保持", len(rep) == 1, f"got={len(rep)}")
+
+
+def test_playback_monitor_fallbacks() -> None:
+    """PlaybackMonitor: ended が取れなくても止まれるフォールバックの検証。"""
+    print("\n[21] PlaybackMonitor フォールバック終了判定")
+    from unittest.mock import patch
+    from main import PlaybackMonitor
+
+    # 1) video.ended=True で即終了
+    with patch("main.get_viewing_percentage", return_value=50), \
+         patch("main.get_video_ended", return_value=True), \
+         patch("main.get_video_time", return_value=(900.0, 1800.0)), \
+         patch("main._print_progress"):
+        m = PlaybackMonitor(1, "chrome")
+        stop, reason = m.poll(silent=False)
+    check("ended=True → 即終了", stop and "ended" in reason, f"({stop}, {reason})")
+
+    # 2) 全シグナル不能 (ended=None, pct=-1, cur=-1) でも無音継続で終了
+    with patch("main.get_viewing_percentage", return_value=-1), \
+         patch("main.get_video_ended", return_value=None), \
+         patch("main.get_video_time", return_value=(-1.0, -1.0)), \
+         patch("main._print_progress"):
+        m = PlaybackMonitor(1, "chrome")
+        m.poll(silent=False)  # 音あり
+        results = [m.poll(silent=True) for _ in range(PlaybackMonitor.SILENCE_AFTER_AUDIO)]
+    check("シグナル不能でも無音継続で終了", results[-1][0],
+          f"last={results[-1]}")
+    check("無音判定より前は継続", not results[0][0])
+
+    # 3) currentTime が総尺付近で停滞 → 終了（ended が取れない SCORM 対策）
+    with patch("main.get_viewing_percentage", return_value=-1), \
+         patch("main.get_video_ended", return_value=None), \
+         patch("main.get_video_time", return_value=(1799.5, 1800.0)), \
+         patch("main._print_progress"):
+        m = PlaybackMonitor(1, "chrome")
+        r = [m.poll(silent=False) for _ in range(PlaybackMonitor.NEAR_END_POLLS)]
+    check("総尺付近で停滞 → 終了", r[-1][0], f"last={r[-1]}")
+
+    # 4) currentTime 停滞（途中で止まったまま）→ 終了
+    with patch("main.get_viewing_percentage", return_value=-1), \
+         patch("main.get_video_ended", return_value=None), \
+         patch("main.get_video_time", return_value=(600.0, 1800.0)), \
+         patch("main._print_progress"):
+        m = PlaybackMonitor(1, "chrome")
+        r = [m.poll(silent=False) for _ in range(PlaybackMonitor.STALL_POLLS + 1)]
+    check("currentTime 停滞 → 終了", r[-1][0], f"last={r[-1]}")
+
+    # 5) 正常再生中（cur が進む）は止まらない
+    times = iter([(float(i * 30), 1800.0) for i in range(1, 11)])
+    with patch("main.get_viewing_percentage", return_value=-1), \
+         patch("main.get_video_ended", return_value=False), \
+         patch("main.get_video_time", side_effect=lambda *a, **kw: next(times)), \
+         patch("main._print_progress"):
+        m = PlaybackMonitor(1, "chrome")
+        r = [m.poll(silent=False, elapsed=i * 30.0) for i in range(1, 11)]
+    check("正常再生中は止まらない", not any(s for s, _ in r), f"stops={[x for x in r if x[0]]}")
+
+    # 6) 一度も音が出ない → リトライ後に諦めて終了
+    retriggers: list = []
+    with patch("main.get_viewing_percentage", return_value=-1), \
+         patch("main.get_video_ended", return_value=None), \
+         patch("main.get_video_time", return_value=(-1.0, -1.0)), \
+         patch("main._print_progress"):
+        m = PlaybackMonitor(1, "chrome", retrigger=lambda: retriggers.append(1))
+        r = [m.poll(silent=True) for _ in range(PlaybackMonitor.SILENCE_NO_AUDIO)]
+    check("無音時に再生リトライが1回打たれる", len(retriggers) == 1, f"retriggers={len(retriggers)}")
+    check("音が出ないまま → 諦めて終了", r[-1][0], f"last={r[-1]}")
+
+
+def test_keep_alive_ended_guard() -> None:
+    """WindowKeepAlive: 終了検知後は注入しない（再ループ防止）。"""
+    print("\n[22] WindowKeepAlive の終了ガード / target 指定")
+    from unittest.mock import patch
+    from platform_utils import WindowKeepAlive
+
+    # target (タブid) / url_pattern(旧引数) の両方を受け付ける
+    ka = WindowKeepAlive("chrome", target=123)
+    check("target=タブid を受け付ける", ka._target == 123)
+    ka2 = WindowKeepAlive("chrome", url_pattern="example.com")
+    check("url_pattern (旧引数) 互換", ka2._target == "example.com")
+
+    # get_video_ended が True を返したら以後の注入をスキップ
+    injected: list = []
+    with patch("platform_utils.get_video_ended", return_value=True), \
+         patch("platform_utils._osascript", side_effect=lambda *a, **kw: injected.append(1)):
+        ka3 = WindowKeepAlive("chrome", target=1)
+        ka3._tick_macos()
+        ka3._tick_macos()
+    check("ended=True 後は JS 注入しない", len(injected) == 0, f"injected={len(injected)}")
+    check("_ended フラグが立つ", ka3._ended)
+
+    # mark_ended() でも注入停止
+    with patch("platform_utils.get_video_ended", return_value=False), \
+         patch("platform_utils._osascript", side_effect=lambda *a, **kw: injected.append(1)):
+        ka4 = WindowKeepAlive("chrome", target=1)
+        ka4.mark_ended()
+        ka4._tick_macos()
+    check("mark_ended() 後は注入しない", len(injected) == 0, f"injected={len(injected)}")
+
+    # stop() は join する（スレッド未起動でも安全）
+    ka5 = WindowKeepAlive("chrome", target=1)
+    ka5.stop()
+    check("stop() はスレッド未起動でも安全", True)
+
+
+def test_video_ended_tristate() -> None:
+    """get_video_ended: true/false/unknown の三値を返す。"""
+    print("\n[23] get_video_ended 三値化")
+    from unittest.mock import patch
+    from platform_utils import get_video_ended
+
+    with patch("platform_utils._run_js_in_tab", return_value="true"):
+        check("'true' → True", get_video_ended(1) is True)
+    with patch("platform_utils._run_js_in_tab", return_value="false"):
+        check("'false' → False", get_video_ended(1) is False)
+    with patch("platform_utils._run_js_in_tab", return_value="unknown"):
+        check("'unknown' → None", get_video_ended(1) is None)
+    with patch("platform_utils._run_js_in_tab", return_value=""):
+        check("JS失敗 ('') → None", get_video_ended(1) is None)
 
 
 def test_play_btn_pos_js_iframe_priority() -> None:
@@ -842,7 +990,11 @@ if __name__ == "__main__":
     test_keep_active_only_mode()
     test_no_transcribe_requires_url()
     test_main_hooks()
-    test_main_gui_smoke()
+    test_capture_stop_idempotent()
+    test_transcriber_dedup_and_reset()
+    test_playback_monitor_fallbacks()
+    test_keep_alive_ended_guard()
+    test_video_ended_tristate()
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

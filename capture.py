@@ -46,6 +46,7 @@ class AudioCapture:
         self._segment_id = 0
         self._samples_captured = 0
         self._stream = None
+        self._stopped = False
 
     def start(self) -> None:
         import sounddevice as sd
@@ -60,6 +61,11 @@ class AudioCapture:
         self._stream.start()
 
     def stop(self) -> None:
+        # 冪等: ended 経路と SIGINT ハンドラの両方から呼ばれても
+        # 末尾セグメントの二重フラッシュ・二重 None を起こさない
+        if self._stopped:
+            return
+        self._stopped = True
         if self._stream:
             self._stream.stop()
             self._stream.close()
@@ -97,15 +103,16 @@ class AudioCapture:
 
     def _flush_remaining(self) -> None:
         with self._lock:
-            if self._buffer_size < self._native_rate:
-                return
-            combined = np.concatenate(self._buffer)
-            start_time = (self._samples_captured - self._buffer_size) / self._native_rate
-            self._queue.put(AudioSegment(
-                data=_resample(combined, self._native_rate),
-                start_time=start_time,
-                segment_id=self._segment_id,
-            ))
+            if self._buffer_size >= self._native_rate:
+                combined = np.concatenate(self._buffer)
+                start_time = (self._samples_captured - self._buffer_size) / self._native_rate
+                self._queue.put(AudioSegment(
+                    data=_resample(combined, self._native_rate),
+                    start_time=start_time,
+                    segment_id=self._segment_id,
+                ))
+            self._buffer = []
+            self._buffer_size = 0
 
 
 # ─── Windows WASAPI Loopback (pyaudiowpatch) ─────────────────────────────────
@@ -129,6 +136,8 @@ class WindowsAudioCapture:
         self._lock = threading.Lock()
         self._native_rate = 44100
         self._channels = 2
+        self._samples_captured = 0
+        self._stopped = False
 
     def _find_loopback(self) -> int:
         pyaudio = self._pyaudio
@@ -162,13 +171,17 @@ class WindowsAudioCapture:
                 pcm = pcm.reshape(-1, self._channels).mean(axis=1)
             with self._lock:
                 self._buffer = np.concatenate([self._buffer, pcm])
+                self._samples_captured += len(pcm)
                 seg_samples = int(self._native_rate * self._segment_duration)
                 ovl_samples = int(self._native_rate * self._overlap_duration)
                 if len(self._buffer) >= seg_samples:
                     seg_data = self._buffer[:seg_samples]
+                    # 実サンプル数ベースで開始時刻を計算（セグメント番号×固定長だと
+                    # ドライバのチャンク境界の端数でドリフトする）
+                    start_time = (self._samples_captured - len(self._buffer)) / self._native_rate
                     self._queue.put(AudioSegment(
                         data=_resample(seg_data, self._native_rate),
-                        start_time=float(self._segment_id) * (self._segment_duration - self._overlap_duration),
+                        start_time=start_time,
                         segment_id=self._segment_id,
                     ))
                     self._segment_id += 1
@@ -186,6 +199,9 @@ class WindowsAudioCapture:
         )
 
     def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
         if self._stream:
             self._stream.stop_stream()
             self._stream.close()
@@ -193,11 +209,13 @@ class WindowsAudioCapture:
             self._pa.terminate()
         with self._lock:
             if len(self._buffer) >= self._native_rate:
+                start_time = (self._samples_captured - len(self._buffer)) / self._native_rate
                 self._queue.put(AudioSegment(
                     data=_resample(self._buffer, self._native_rate),
-                    start_time=float(self._segment_id) * (self._segment_duration - self._overlap_duration),
+                    start_time=start_time,
                     segment_id=self._segment_id,
                 ))
+            self._buffer = np.array([], dtype=np.float32)
         self._queue.put(None)
 
     def segments(self) -> Iterator[AudioSegment]:

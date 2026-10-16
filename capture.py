@@ -14,6 +14,31 @@ DTYPE = "float32"
 SYSTEM = platform.system()
 
 
+def downmix_to_mono(x: np.ndarray) -> np.ndarray:
+    """(frames, channels) → mono。逆相ステレオに耐える。
+
+    通常は L/R の平均を取るが、L ≈ -R（逆相）でエンコードされた音声では
+    平均が打ち消し合ってほぼ無音になり、Whisper が幻覚だけを返す
+    （2026-10-16 のガイダンス動画で実測: corr(L,R)=-0.96、平均の RMS は
+    片側の 1/7）。差 (L-R)/2 の方が和より明らかに大きければ差を使う。
+    """
+    if x.ndim == 1:
+        return x
+    if x.shape[1] == 1:
+        return x[:, 0]
+    if x.shape[1] > 2:
+        # 位相判定は 2ch 前提。それ以外は従来どおり全 ch 平均
+        return np.mean(x, axis=1).astype(np.float32)
+    left = x[:, 0].astype(np.float32)
+    right = x[:, 1].astype(np.float32)
+    mid = (left + right) * 0.5
+    if float(np.dot(left, right)) < 0.0:
+        side = (left - right) * 0.5
+        if float(np.sqrt(np.mean(np.square(side)))) > 2.0 * float(np.sqrt(np.mean(np.square(mid)))):
+            return side
+    return mid
+
+
 @dataclass
 class AudioSegment:
     data: np.ndarray   # float32, 16kHz, モノラル
@@ -82,7 +107,7 @@ class AudioCapture:
     def _callback(self, indata, frames, time_info, status) -> None:
         if status:
             print(f"[capture] {status}")
-        mono = np.mean(indata, axis=1) if indata.ndim > 1 else indata[:, 0]
+        mono = downmix_to_mono(indata)
         with self._lock:
             self._buffer.append(mono.copy())
             self._buffer_size += len(mono)
@@ -168,7 +193,7 @@ class WindowsAudioCapture:
         def callback(in_data, frame_count, time_info, status):
             pcm = np.frombuffer(in_data, dtype=np.float32)
             if self._channels > 1:
-                pcm = pcm.reshape(-1, self._channels).mean(axis=1)
+                pcm = downmix_to_mono(pcm.reshape(-1, self._channels))
             with self._lock:
                 self._buffer = np.concatenate([self._buffer, pcm])
                 self._samples_captured += len(pcm)

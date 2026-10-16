@@ -966,6 +966,539 @@ def test_play_btn_pos_js_iframe_priority() -> None:
 
 # ─── main ────────────────────────────────────────────────────────────────────
 
+
+def test_tab_condition_string_compare() -> None:
+    """#16: タブ id 照合は必ず文字列比較にする（docs/fix-plan-tab-id.md）。
+
+    Chrome の `id of tab` は text で返るため、`id of t is 2144314444` の
+    整数リテラル比較は一度も一致しない。既存テストは osascript をモックするので
+    この障害を検出できなかった。ここでは生成される AppleScript の文面そのものと、
+    （macOS なら）osacompile による構文検証を行う。Chrome は一切操作しない。
+    """
+    print("\n[25] _tab_condition の文字列比較 / タブ未発見の可視化")
+    import platform
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+    import platform_utils
+    from platform_utils import _tab_condition, _run_js_in_tab
+
+    big = 2144314444  # 実ログに出た Chrome のタブ id（2^29 超）
+    line = _tab_condition(big)
+    check("int: (id of t as string) で比較する", "(id of t as string)" in line, line.strip())
+    check("int: id は引用符付き文字列リテラル", f'is "{big}"' in line, line.strip())
+    check("int: 整数リテラル比較に戻っていない", f"is {big} then" not in line)
+    sline = _tab_condition("player.php?a=123")
+    check("str: URL 部分一致は従来どおり", sline.strip() == 'if URL of t contains "player.php?a=123" then', sline.strip())
+
+    # _run_js_in_tab が生成するスクリプト全体を捕まえる（osascript は実行しない）
+    captured: list[str] = []
+
+    def fake_osascript(script: str, timeout: float = 10.0):
+        captured.append(script)
+        r = MagicMock(); r.returncode = 0; r.stdout = "hello\n"
+        return r
+
+    platform_utils._no_tab_warned.clear()
+    with patch("platform_utils._osascript", side_effect=fake_osascript):
+        out = _run_js_in_tab("document.title", big)
+    check("通常時は stdout をそのまま返す", out == "hello", repr(out))
+    script = captured[0]
+    check("スクリプト末尾に __NO_TAB__ 番兵がある", 'return "__NO_TAB__"' in script)
+    check("番兵は repeat の外（最後の end repeat より後）",
+          'return "__NO_TAB__"' in script and "end repeat" in script
+          and script.index('return "__NO_TAB__"') > script.rindex("end repeat"))
+
+    if platform.system() == "Darwin" and shutil.which("osacompile"):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "s.applescript"
+            src.write_text(script)
+            r = subprocess.run(["osacompile", "-o", str(Path(d) / "s.scpt"), str(src)],
+                               capture_output=True, text=True, timeout=30)
+            check("生成 AppleScript が osacompile を通る（実行はしない）",
+                  r.returncode == 0, r.stderr.strip()[:120])
+    else:
+        check("osacompile 構文検証", True, "スキップ (非macOS)")
+
+    # タブ未発見: 番兵を受けたら "" を返し、target ごとに 1 回だけ警告する
+    warnings: list = []
+
+    def fake_no_tab(script: str, timeout: float = 10.0):
+        r = MagicMock(); r.returncode = 0; r.stdout = "__NO_TAB__\n"
+        return r
+
+    platform_utils._no_tab_warned.clear()
+    with patch("platform_utils._osascript", side_effect=fake_no_tab), \
+         patch.object(platform_utils._logger, "warning", side_effect=lambda *a, **kw: warnings.append(a)):
+        o1 = _run_js_in_tab("1", big)
+        o2 = _run_js_in_tab("1", big)
+        o3 = _run_js_in_tab("1", big + 1)
+    check("タブ未発見時は '' を返す", o1 == "" and o2 == "" and o3 == "")
+    check("警告は target ごとに 1 回だけ", len(warnings) == 2, f"warnings={len(warnings)}")
+    check("警告文に target が含まれる", any(str(big) in str(w) for w in warnings))
+    platform_utils._no_tab_warned.clear()
+
+
+def test_trigger_video_play_verifies_playback() -> None:
+    """#17: trigger_video_play は「クリック API が成功した」ではなく
+    「video.paused が false になった」を実測して True を返す。"""
+    print("\n[26] trigger_video_play の再生実測")
+    from unittest.mock import patch, MagicMock
+    import platform_utils
+    from platform_utils import trigger_video_play
+
+    if platform_utils.SYSTEM != "Darwin":
+        check("trigger_video_play (macOS専用)", True, "スキップ (非macOS)")
+        return
+
+    def mk_run_js(before_play, after_play="playing"):
+        """_VIDEO_PLAYING_JS は play() が呼ばれる前は before_play、後は after_play を返す。"""
+        calls = {"play": 0, "state": 0}
+        def _run(js, target, browser="chrome"):
+            if js is platform_utils._GET_PLAY_BTN_POS_JS:
+                return "942,744"
+            if js is platform_utils._PLAY_VIDEO_JS:
+                calls["play"] += 1
+                return "playing"
+            if js is platform_utils._VIDEO_PLAYING_JS:
+                calls["state"] += 1
+                return after_play if calls["play"] else before_play
+            return ""
+        return _run, calls
+
+    ok_osa = MagicMock(); ok_osa.returncode = 0; ok_osa.stdout = "Google Chrome\n"
+    # 1 poll = 0.5 秒進む疑似時計（_wait_playing の窓を確実に使い切る）
+    import itertools
+    fake_clock = lambda: patch("platform_utils.time.monotonic", side_effect=itertools.count(0.0, 0.5))
+
+    # 1) クリック後に playing → True、play() は呼ばれない
+    clicks: list = []
+    run_js, calls = mk_run_js("playing")
+    with patch("platform_utils._run_js_in_tab", side_effect=run_js), \
+         patch("platform_utils._cg_click", side_effect=lambda x, y: clicks.append((x, y)) or True), \
+         patch("platform_utils._osascript", return_value=ok_osa), \
+         patch("platform_utils.time.sleep"), fake_clock():
+        r = trigger_video_play(1)
+    check("クリックで再生開始 → True", r is True)
+    check("クリック座標が JS の返した位置", clicks == [(942, 744)], f"clicks={clicks}")
+    check("クリックで始まれば play() は呼ばれない", calls["play"] == 0, f"play={calls['play']}")
+
+    # 2) クリックでは始まらず play() で始まる → True（Step2 を実際に通す）
+    run_js, calls = mk_run_js("paused", "playing")
+    with patch("platform_utils._run_js_in_tab", side_effect=run_js), \
+         patch("platform_utils._cg_click", return_value=True), \
+         patch("platform_utils._osascript", return_value=ok_osa), \
+         patch("platform_utils.time.sleep"), fake_clock():
+        r = trigger_video_play(1)
+    check("play() で再生開始 → True", r is True)
+    check("play() が 1 回呼ばれた", calls["play"] == 1, f"play={calls['play']}")
+
+    # 3) クリックも play() も効かない（autoplay policy 拒否）→ False
+    run_js, calls = mk_run_js("paused", "paused")
+    with patch("platform_utils._run_js_in_tab", side_effect=run_js), \
+         patch("platform_utils._cg_click", return_value=True), \
+         patch("platform_utils._osascript", return_value=ok_osa), \
+         patch("platform_utils.time.sleep"), fake_clock():
+        r = trigger_video_play(1)
+    check("再生が始まらなければ False（旧実装は True を返していた）", r is False)
+    check("False でも play() は試みている", calls["play"] == 1, f"play={calls['play']}")
+    check("False は有限回のポーリングで確定（無限ループではない）", calls["state"] <= 12, f"state_polls={calls['state']}")
+
+    # 4) CG クリック失敗時は System Events にフォールバックする
+    osa_calls: list = []
+    def rec_osa(script, timeout=10.0):
+        osa_calls.append(script); return ok_osa
+    run_js, _ = mk_run_js("playing")
+    with patch("platform_utils._run_js_in_tab", side_effect=run_js), \
+         patch("platform_utils._cg_click", return_value=False), \
+         patch("platform_utils._osascript", side_effect=rec_osa), \
+         patch("platform_utils.time.sleep"), fake_clock():
+        r = trigger_video_play(1)
+    check("CG 失敗時は System Events click にフォールバック",
+          any("click at {942, 744}" in c for c in osa_calls))
+
+    # 4b) System Events フォールバックも失敗 → False / 座標が取れない → False
+    bad_osa = MagicMock(); bad_osa.returncode = 1; bad_osa.stdout = ""
+    def osa_click_fails(script, timeout=10.0):
+        return bad_osa if "click at" in script else ok_osa
+    run_js, _ = mk_run_js("playing")
+    with patch("platform_utils._run_js_in_tab", side_effect=run_js), \
+         patch("platform_utils._cg_click", return_value=False), \
+         patch("platform_utils._osascript", side_effect=osa_click_fails), \
+         patch("platform_utils.time.sleep"), fake_clock():
+        r = trigger_video_play(1)
+    check("フォールバックも失敗 → False", r is False)
+    with patch("platform_utils._run_js_in_tab", return_value=""), \
+         patch("platform_utils._cg_click", return_value=True):
+        check("座標が取れない → False", trigger_video_play(1) is False)
+
+    # 5) _cg_click 本体: subprocess.run の呼び方と戻り値の契約
+    from platform_utils import _cg_click
+    runs: list = []
+    def fake_run(argv, capture_output=True, text=True, timeout=10):
+        runs.append(argv)
+        m = MagicMock(); m.returncode = 0; m.stdout = "ok\n"; m.stderr = ""
+        return m
+    with patch("platform_utils.subprocess.run", side_effect=fake_run):
+        ok = _cg_click(942, 744)
+    check("_cg_click: rc=0 & 'ok' → True", ok is True)
+    argv = runs[0]
+    check("_cg_click: osascript -l JavaScript -e <jxa> で呼ぶ",
+          argv[:4] == ["osascript", "-l", "JavaScript", "-e"] and len(argv) == 5, f"argv={argv[:4]}")
+    check("_cg_click: 座標が JXA に埋め込まれる", "CGPointMake(942, 744)" in argv[-1])
+    check("_cg_click: CGEventPost を使う", "CGEventPost" in argv[-1])
+
+    def run_rc1(argv, **kw):
+        m = MagicMock(); m.returncode = 1; m.stdout = ""; m.stderr = "err"; return m
+    with patch("platform_utils.subprocess.run", side_effect=run_rc1):
+        check("_cg_click: rc≠0 → False", _cg_click(1, 2) is False)
+    def run_no_ok(argv, **kw):
+        m = MagicMock(); m.returncode = 0; m.stdout = ""; m.stderr = ""; return m
+    with patch("platform_utils.subprocess.run", side_effect=run_no_ok):
+        check("_cg_click: stdout に ok 無し → False", _cg_click(1, 2) is False)
+    import subprocess as _sp
+    with patch("platform_utils.subprocess.run", side_effect=_sp.TimeoutExpired("osascript", 10)):
+        check("_cg_click: TimeoutExpired → False", _cg_click(1, 2) is False)
+    with patch("platform_utils.subprocess.run", side_effect=OSError("boom")):
+        check("_cg_click: OSError → False", _cg_click(1, 2) is False)
+
+    # 6) JXA の構文を osacompile で検証（コンパイルのみ・イベントは投稿しない）
+    if shutil.which("osacompile"):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "c.js"
+            src.write_text(platform_utils._CG_CLICK_JXA % (1, 2))
+            r = subprocess.run(["osacompile", "-l", "JavaScript", "-o", str(Path(d) / "c.scpt"), str(src)],
+                               capture_output=True, text=True, timeout=30)
+            check("JXA が osacompile -l JavaScript を通る", r.returncode == 0, r.stderr.strip()[:120])
+    else:
+        check("JXA 構文検証", True, "スキップ (osacompile なし)")
+
+
+def test_playback_monitor_not_started() -> None:
+    """#18: currentTime が 0 のまま → 「停滞終了」ではなく再試行→中止。played=False。"""
+    print("\n[27] PlaybackMonitor 再生未開始の扱い")
+    from unittest.mock import patch
+    from main import PlaybackMonitor
+
+    retriggers: list = []
+    with patch("main.get_viewing_percentage", return_value=0), \
+         patch("main.get_video_ended", return_value=False), \
+         patch("main.get_video_time", return_value=(0.0, 262.0)), \
+         patch("main._print_progress"):
+        m = PlaybackMonitor(1, "chrome", retrigger=lambda: retriggers.append(1))
+        r = [m.poll(silent=False, elapsed=i * 30.0) for i in range(1, PlaybackMonitor.NOT_STARTED_GIVEUP + 1)]
+    early = r[:PlaybackMonitor.STALL_POLLS + 1]
+    check("cur=0 のままでは STALL_POLLS で『停滞終了』しない", not any(s for s, _ in early),
+          f"stops={[x for x in early if x[0]]}")
+    check("未開始なら再生リトライが打たれる", len(retriggers) == PlaybackMonitor.NOT_STARTED_MAX_RETRY,
+          f"retriggers={len(retriggers)}")
+    check("未開始のまま → 中止で終了", r[-1][0] and "中止" in r[-1][1], f"last={r[-1]}")
+    check("played=False のまま", m.played is False)
+
+    # 再生が始まれば played=True になり、以後は通常の停滞判定に戻る
+    times = iter([(0.0, 262.0), (0.0, 262.0), (30.0, 262.0), (60.0, 262.0), (60.0, 262.0),
+                  (60.0, 262.0), (60.0, 262.0), (60.0, 262.0), (60.0, 262.0)])
+    with patch("main.get_viewing_percentage", return_value=0), \
+         patch("main.get_video_ended", return_value=False), \
+         patch("main.get_video_time", side_effect=lambda *a, **kw: next(times)), \
+         patch("main._print_progress"):
+        m2 = PlaybackMonitor(1, "chrome")
+        r2 = [m2.poll(silent=False, elapsed=i * 30.0) for i in range(9)]
+    check("再生開始後は played=True", m2.played is True)
+    check("再生開始後の停滞は従来どおり終了", r2[-1][0] and "停滞" in r2[-1][1], f"last={r2[-1]}")
+
+    # 境界値: cur=0.9 は未開始、cur=1.0 で開始済み
+    for cur, expect in ((0.9, False), (1.0, True)):
+        with patch("main.get_viewing_percentage", return_value=0), \
+             patch("main.get_video_ended", return_value=False), \
+             patch("main.get_video_time", return_value=(cur, 262.0)), \
+             patch("main._print_progress"):
+            mb = PlaybackMonitor(1, "chrome"); mb.poll(silent=False)
+        check(f"cur={cur} → played={expect}", mb.played is expect)
+
+    # ended=True なら cur が取れなくても played=True（保存/離脱を押す）
+    with patch("main.get_viewing_percentage", return_value=-1), \
+         patch("main.get_video_ended", return_value=True), \
+         patch("main.get_video_time", return_value=(-1.0, -1.0)), \
+         patch("main._print_progress"):
+        me = PlaybackMonitor(1, "chrome"); stop, reason = me.poll(silent=False)
+    check("ended=True & cur 不明 → 終了かつ played=True", stop and me.played is True)
+
+    # 既視聴 (pct=100) で再生が始まらない → 4 分待たず PCT100_POLLS で終了、played=True
+    with patch("main.get_viewing_percentage", return_value=100), \
+         patch("main.get_video_ended", return_value=False), \
+         patch("main.get_video_time", return_value=(0.0, 262.0)), \
+         patch("main._print_progress"):
+        mp = PlaybackMonitor(1, "chrome")
+        rp = [mp.poll(silent=False) for _ in range(PlaybackMonitor.PCT100_POLLS)]
+    check("pct=100 & 未開始 → 視聴状況 100% で終了", rp[-1][0] and "100%" in rp[-1][1], f"last={rp[-1]}")
+    check("pct=100 終了は played=True（保存/離脱を押す）", mp.played is True)
+
+
+def test_downmix_antiphase() -> None:
+    """#19: 逆相ステレオ (L ≈ -R) を平均で打ち消さない。"""
+    print("\n[28] 逆相ステレオのダウンミックス")
+    from capture import downmix_to_mono
+    sr = 16000
+    t = np.arange(sr) / sr
+    sig = (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    rms = lambda a: float(np.sqrt(np.mean(np.square(a))))
+
+    inphase = np.stack([sig, sig], axis=1)
+    m = downmix_to_mono(inphase)
+    check("同相: 平均と一致", np.allclose(m, sig, atol=1e-6))
+
+    anti = np.stack([sig, -sig], axis=1)
+    m2 = downmix_to_mono(anti)
+    check("逆相: 打ち消されない（RMS が片側と同等）", abs(rms(m2) - rms(sig)) < 0.01, f"rms={rms(m2):.4f}")
+    check("旧実装 (mean) なら無音になっていた", rms(anti.mean(axis=1)) < 1e-6)
+
+    mono_in = sig.reshape(-1, 1)
+    check("1ch 入力はそのまま", np.allclose(downmix_to_mono(mono_in), sig))
+    check("1次元入力はそのまま", downmix_to_mono(sig) is sig)
+
+    # AudioCapture._callback 経由でも逆相が保持される
+    from unittest.mock import MagicMock, patch
+    mock_sd = MagicMock()
+    mock_sd.query_devices.return_value = {"default_samplerate": 16000.0, "max_input_channels": 2}
+    with patch.dict(sys.modules, {"sounddevice": mock_sd}):
+        import importlib, capture as cap
+        importlib.reload(cap)
+        c = cap.AudioCapture(device_index=0, segment_duration=1.0, overlap_duration=0.0)
+        c._callback(np.stack([sig, -sig], axis=1), len(sig), None, None)
+        seg = c._queue.get(timeout=1)
+    check("_callback 経由でも逆相セグメントの RMS が保たれる", rms(seg.data) > 0.15, f"rms={rms(seg.data):.4f}")
+
+    # 閾値 2.0 を両側から固定する
+    voice = sig
+    amb = (0.35 * np.sin(2 * np.pi * 330 * t)).astype(np.float32)
+    # (i) 中央ボイス + 逆相アンビエンス: dot<0 だが side/mid≈1.17 → mid（ボイス保持）
+    part = np.stack([voice + amb, voice - amb], axis=1)
+    check("部分逆相 (side/mid≈1.2) は mid を選びボイスを保持", np.allclose(downmix_to_mono(part), voice, atol=1e-5))
+    # (ii) 実測相当 (R ≈ -0.74 L, side/mid≈6.7) → side
+    real = np.stack([voice, -0.74 * voice], axis=1)
+    check("実測相当の逆相 (side/mid≈6.7) は side を選ぶ",
+          np.allclose(downmix_to_mono(real), (voice - (-0.74 * voice)) * 0.5, atol=1e-5))
+    # (iii) 境界: k=0.32 → side/mid≈1.94 → mid / k=0.34 → ≈2.03 → side
+    lo = np.stack([voice, -0.32 * voice], axis=1)
+    hi = np.stack([voice, -0.34 * voice], axis=1)
+    check("境界直下 (≈1.94) は mid", np.allclose(downmix_to_mono(lo), (voice - 0.32 * voice) * 0.5, atol=1e-5))
+    check("境界直上 (≈2.03) は side", np.allclose(downmix_to_mono(hi), (voice + 0.34 * voice) * 0.5, atol=1e-5))
+    # (iv) 無相関 L/R → mid
+    g = np.random.default_rng(0)
+    xl = (g.standard_normal(sr) * 0.1).astype(np.float32); xr = (g.standard_normal(sr) * 0.1).astype(np.float32)
+    check("無相関 L/R は mid", np.allclose(downmix_to_mono(np.stack([xl, xr], axis=1)), (xl + xr) * 0.5, atol=1e-6))
+    # (v) 3ch 以上は全 ch 平均
+    four = np.stack([voice, voice, np.zeros_like(voice), np.zeros_like(voice)], axis=1)
+    check("4ch 入力は全 ch 平均", np.allclose(downmix_to_mono(four), voice * 0.5, atol=1e-6))
+
+
+def test_boundary_dedup_fuzzy() -> None:
+    """#20: 境界をまたぐ語尾ゆれ（終わりました/終わります）を重複とみなす。"""
+    print("\n[29] 境界重複のあいまい一致")
+    from transcriber import _similar, _norm_text, Transcriber
+    a = _norm_text("以上ガイダンスの説明は終わりました")
+    b = _norm_text("以上ガイダンスの説明は終わります")
+    check("語尾ゆれは類似", _similar(a, b))
+    check("短い文は類似扱いしない", not _similar("はい", "はい。ええ"))
+    check("別内容は類似しない", not _similar(_norm_text("授業の概要について説明します"),
+                                            _norm_text("評価の方法は授業への参加状況")))
+
+    from collections import deque
+    tr = Transcriber.__new__(Transcriber)
+    tr._prev_end = 0.0
+    tr._recent_texts = deque(maxlen=8)
+    out1 = tr._dedup([{"text": "以上ガイダンスの説明は終わりました", "start": 20.0, "end": 24.0}], 180.0)
+    # 次セグメント（オフセット 200, オーバーラップ 5 秒）の境界に語尾ゆれで再出現
+    out2 = tr._dedup([{"text": "以上ガイダンスの説明は終わります", "start": 0.5, "end": 3.5},
+                      {"text": "皆さんはこれから学習を進めてください", "start": 4.0, "end": 8.0}], 200.0)
+    check("1本目は出力", len(out1) == 1)
+    check("境界の語尾ゆれ重複は除去、続きは出力", [o.text for o in out2] == ["皆さんはこれから学習を進めてください"],
+          f"{[o.text for o in out2]}")
+
+    import difflib
+    ratio = lambda x, y: difflib.SequenceMatcher(None, _norm_text(x), _norm_text(y)).ratio()
+    base = "以上ガイダンスの説明は終わりました"
+    below = "以上ガイダンスの説明は終了です次へ"            # ratio ≈ 0.71 (< 0.75)
+    above = "ガイダンスの説明は終わりました次は評価です"     # ratio ≈ 0.79 (> 0.75)
+    check("閾値直下の対は類似しない", ratio(base, below) < 0.75 and not _similar(_norm_text(base), _norm_text(below)),
+          f"ratio={ratio(base, below):.3f}")
+    check("閾値直上の対は類似", ratio(base, above) > 0.75 and _similar(_norm_text(base), _norm_text(above)),
+          f"ratio={ratio(base, above):.3f}")
+
+    # 末尾 + 新規内容（ratio 0.5）は境界でも保持される
+    tr2 = Transcriber.__new__(Transcriber); tr2._prev_end = 0.0; tr2._recent_texts = deque(maxlen=8)
+    tr2._dedup([{"text": base, "start": 20.0, "end": 24.0}], 180.0)
+    kept = tr2._dedup([{"text": "説明は終わりました次は評価についてです", "start": 0.5, "end": 6.0}], 200.0)
+    check("境界で ratio≈0.5 の『末尾+新規内容』は保持", [o.text for o in kept] == ["説明は終わりました次は評価についてです"])
+
+    # 一文字違いの別文 (ratio 0.8) でも境界をまたがなければ保持
+    tr3 = Transcriber.__new__(Transcriber); tr3._prev_end = 0.0; tr3._recent_texts = deque(maxlen=8)
+    tr3._dedup([{"text": "ここで出席を取ります", "start": 0.0, "end": 3.0}], 0.0)
+    kept3 = tr3._dedup([{"text": "ここで休憩を取ります", "start": 0.0, "end": 3.0}], 10.0)
+    check("非境界の類似文は保持（連続セグメント）", [o.text for o in kept3] == ["ここで休憩を取ります"])
+
+    # 最小長 8: 7 文字は包含でも非類似、8 文字で包含は類似
+    check("7 文字の包含は非類似", not _similar("評価の方法は授", "評価の方法は授業への"))
+    check("8 文字の包含は類似", _similar("評価の方法は授業", "評価の方法は授業への"))
+
+
+def test_playback_monitor_rewind_after_end() -> None:
+    """#21: 末尾付近まで再生後に currentTime が 0 へ戻ったら即終了。"""
+    print("\n[30] 末尾到達後の巻き戻し検出")
+    from unittest.mock import patch
+    from main import PlaybackMonitor
+    times = iter([(30.0, 262.0), (120.0, 262.0), (258.0, 262.0), (0.0, 262.0)])
+    with patch("main.get_viewing_percentage", return_value=50), \
+         patch("main.get_video_ended", return_value=False), \
+         patch("main.get_video_time", side_effect=lambda *a, **kw: next(times)), \
+         patch("main._print_progress"):
+        m = PlaybackMonitor(1, "chrome")
+        r = [m.poll(silent=False, elapsed=i * 30.0) for i in range(4)]
+    check("巻き戻し直後に終了", r[-1][0] and "巻き戻し" in r[-1][1], f"last={r[-1]}")
+    check("それ以前は継続", not any(s for s, _ in r[:3]))
+
+    # 途中（末尾未到達）で 0 に戻った場合は巻き戻し終了にしない
+    times2 = iter([(30.0, 262.0), (60.0, 262.0), (0.0, 262.0)])
+    with patch("main.get_viewing_percentage", return_value=20), \
+         patch("main.get_video_ended", return_value=False), \
+         patch("main.get_video_time", side_effect=lambda *a, **kw: next(times2)), \
+         patch("main._print_progress"):
+        m2 = PlaybackMonitor(1, "chrome")
+        r2 = [m2.poll(silent=False, elapsed=i * 30.0) for i in range(3)]
+    check("末尾未到達の 0 戻りでは終了しない", not r2[-1][0], f"last={r2[-1]}")
+
+
+def test_callers_skip_save_exit_when_not_played() -> None:
+    """#22: 未再生で中止したとき、呼び出し側 3 経路が保存/離脱を押さない（対照: 再生済みは押す）。"""
+    print("\n[31] 未再生時は保存/離脱クリックをスキップ（_process_one_url / _keep_active_one_url / run）")
+    import argparse, threading, tempfile
+    from unittest.mock import MagicMock, patch
+    from main import _process_one_url, _keep_active_one_url, PlaybackMonitor, build_parser
+
+    url = "https://example.com/mod/scorm/player.php?id=42"
+
+    def run_process(video_time, ended, pct):
+        n_seg = PlaybackMonitor.NOT_STARTED_GIVEUP + 2
+        segs = []
+        for i in range(n_seg):
+            m = MagicMock(); m.segment_id = i; m.data = np.zeros(16000, dtype=np.float32); m.start_time = 30.0 * i
+            segs.append(m)
+        cap = MagicMock(); cap.segments.return_value = iter(segs)
+        ka = MagicMock()
+        tr = MagicMock(); tr.transcribe.return_value = []
+        args = argparse.Namespace(keep_active="chrome", verbose=False, timestamps=False, format="txt",
+                                  output=None, model="tiny", language="ja", segment_duration=30.0,
+                                  overlap=5.0, keep_interval=20.0, save_interval=60.0)
+        saves: list = []; exits: list = []; triggers: list = []
+        with tempfile.TemporaryDirectory() as d, \
+             patch("main.navigate_to_url"), patch("main.time.sleep"), \
+             patch("main.get_active_tab_id", return_value=42), \
+             patch("main.wait_for_page_ready", return_value=url), \
+             patch("main.get_moodle_page_info", return_value=("講義", url)), \
+             patch("main.create_capture", return_value=cap), \
+             patch("main.WindowKeepAlive", return_value=ka), \
+             patch("main._trigger_with_retry", side_effect=lambda *a, **kw: triggers.append(1)), \
+             patch("main.get_viewing_percentage", return_value=pct), \
+             patch("main.get_video_ended", return_value=ended), \
+             patch("main.get_video_time", return_value=video_time), \
+             patch("main.click_save_button", side_effect=lambda *a, **kw: saves.append(1)), \
+             patch("main.click_exit_activity_button", side_effect=lambda *a, **kw: exits.append(1)), \
+             patch("main._prompt_rename", side_effect=lambda p: p), \
+             patch("main.OutputWriter"), patch("main._print_progress"):
+            args.output = d
+            _process_one_url(url, 0, 1, tr, args, 0, "BlackHole 2ch", {"keep_alive": None, "capture": None},
+                             threading.Event())
+        return saves, exits, triggers, ka, cap
+
+    saves, exits, triggers, ka, cap = run_process((0.0, 262.0), False, 0)
+    check("_process_one_url 未再生: 保存クリック 0 回", len(saves) == 0, f"saves={len(saves)}")
+    check("_process_one_url 未再生: 離脱クリック 0 回", len(exits) == 0, f"exits={len(exits)}")
+    check("_process_one_url 未再生: 再生リトライが打たれた（初回 + 再試行）",
+          len(triggers) == 1 + PlaybackMonitor.NOT_STARTED_MAX_RETRY, f"triggers={len(triggers)}")
+    check("_process_one_url 未再生: keep_alive.mark_ended/stop は呼ばれる", ka.mark_ended.called and ka.stop.called)
+    check("_process_one_url 未再生: capture.stop は呼ばれる", cap.stop.called)
+
+    saves, exits, _, _, _ = run_process((3600.0, 3600.0), True, 100)
+    check("_process_one_url 再生済み(対照): 保存 1 回・離脱 1 回", len(saves) == 1 and len(exits) == 1,
+          f"saves={len(saves)} exits={len(exits)}")
+
+    # ── _keep_active_one_url ──
+    def run_keep(video_time, ended, pct):
+        args = argparse.Namespace(keep_active="chrome", keep_interval=20.0, save_interval=60.0, segment_duration=30.0)
+        ev = threading.Event(); saves: list = []; exits: list = []; ka = MagicMock()
+        waits = {"n": 0}
+        def bounded_wait(timeout=None):
+            waits["n"] += 1
+            return waits["n"] > PlaybackMonitor.NOT_STARTED_GIVEUP + 3  # 止まらない回帰はハングでなく脱出
+        with patch("main.navigate_to_url"), patch("main.time.sleep"), \
+             patch("main.get_active_tab_id", return_value=42), \
+             patch("main.wait_for_page_ready", return_value=url), \
+             patch("main.get_moodle_page_info", return_value=("講義", url)), \
+             patch("main.WindowKeepAlive", return_value=ka), \
+             patch("main._trigger_with_retry"), \
+             patch("main.get_viewing_percentage", return_value=pct), \
+             patch("main.get_video_ended", return_value=ended), \
+             patch("main.get_video_time", return_value=video_time), \
+             patch("main.click_save_button", side_effect=lambda *a, **kw: saves.append(1)), \
+             patch("main.click_exit_activity_button", side_effect=lambda *a, **kw: exits.append(1)), \
+             patch("main._print_progress"), \
+             patch.object(ev, "wait", side_effect=bounded_wait):
+            _keep_active_one_url(url, 0, 1, args, ev, {"keep_alive": None})
+        return saves, exits, ka
+
+    saves, exits, ka = run_keep((0.0, 262.0), False, 0)
+    check("_keep_active_one_url 未再生: 保存/離脱 0 回", len(saves) == 0 and len(exits) == 0,
+          f"saves={len(saves)} exits={len(exits)}")
+    check("_keep_active_one_url 未再生: 停止分岐に到達（mark_ended）", ka.mark_ended.called)
+    check("_keep_active_one_url 未再生: keep_alive.stop は呼ばれる", ka.stop.called)
+    saves, exits, _ = run_keep((3600.0, 3600.0), True, 100)
+    check("_keep_active_one_url 再生済み(対照): 保存/離脱 1 回ずつ", len(saves) == 1 and len(exits) == 1)
+
+    # ── run() シングルモード（モニタループを通す） ──
+    def run_single(video_time, ended, pct):
+        from main import run
+        n_seg = PlaybackMonitor.NOT_STARTED_GIVEUP + 2
+        segs = []
+        for i in range(n_seg):
+            m = MagicMock(); m.segment_id = i; m.data = np.zeros(16000, dtype=np.float32); m.start_time = 30.0 * i
+            segs.append(m)
+        cap = MagicMock(); cap.segments.return_value = iter(segs)
+        saves: list = []; exits: list = []; ka = MagicMock()
+        sd_mod = MagicMock(); sd_mod.query_devices.return_value = {"name": "BlackHole 2ch"}
+        with tempfile.TemporaryDirectory() as d:
+            args = build_parser().parse_args(["--moodle-url", "example.com", "--no-auto-routing",
+                                              "--output", d, "--model", "tiny"])
+            with patch.dict(sys.modules, {"sounddevice": sd_mod}), \
+                 patch("main.find_loopback_device", return_value=0), \
+                 patch("main.get_tab_id_by_pattern", return_value=42), \
+                 patch("main.get_tab_url", return_value=url), \
+                 patch("main.get_moodle_page_info", return_value=("講義", url)), \
+                 patch("main.create_capture", return_value=cap), \
+                 patch("main.WindowKeepAlive", return_value=ka), \
+                 patch("main._trigger_with_retry"), \
+                 patch("main.get_viewing_percentage", return_value=pct), \
+                 patch("main.get_video_ended", return_value=ended), \
+                 patch("main.get_video_time", return_value=video_time), \
+                 patch("main.click_save_button", side_effect=lambda *a, **kw: saves.append(1)), \
+                 patch("main.click_exit_activity_button", side_effect=lambda *a, **kw: exits.append(1)), \
+                 patch("main._prompt_rename", side_effect=lambda p: p), \
+                 patch("main.OutputWriter"), patch("main._print_progress"), \
+                 patch("main.time.sleep"), patch("main.signal.signal"), \
+                 patch("transcriber.Transcriber", return_value=MagicMock(transcribe=MagicMock(return_value=[]))):
+                rc = run(args)
+        return rc, saves, exits, ka
+
+    rc, saves, exits, ka = run_single((0.0, 262.0), False, 0)
+    check("run() 未再生: rc=0 で終了", rc == 0, f"rc={rc}")
+    check("run() 未再生: 保存/離脱 0 回", len(saves) == 0 and len(exits) == 0, f"saves={len(saves)} exits={len(exits)}")
+    check("run() 未再生: 停止分岐に到達（keep_alive.mark_ended）", ka.mark_ended.called)
+    rc, saves, exits, _ = run_single((3600.0, 3600.0), True, 100)
+    check("run() 再生済み(対照): 保存/離脱 1 回ずつ", len(saves) == 1 and len(exits) == 1,
+          f"saves={len(saves)} exits={len(exits)}")
+
 if __name__ == "__main__":
     print("=" * 55)
     print("moodle-transcriber 自動テスト")
@@ -995,6 +1528,13 @@ if __name__ == "__main__":
     test_playback_monitor_fallbacks()
     test_keep_alive_ended_guard()
     test_video_ended_tristate()
+    test_tab_condition_string_compare()
+    test_trigger_video_play_verifies_playback()
+    test_playback_monitor_not_started()
+    test_downmix_antiphase()
+    test_boundary_dedup_fuzzy()
+    test_playback_monitor_rewind_after_end()
+    test_callers_skip_save_exit_when_not_played()
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

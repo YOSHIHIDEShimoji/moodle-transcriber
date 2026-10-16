@@ -6,6 +6,7 @@ macOS では whisper-server を常駐させ、セグメントごとの
 """
 
 import atexit
+import difflib
 import io
 import json
 import logging
@@ -81,6 +82,22 @@ _NORM_RE = re.compile(r"[\s、。,.．，!?！？]+")
 
 def _norm_text(text: str) -> str:
     return _NORM_RE.sub("", text)
+
+
+# 境界セグメントの重複判定。完全一致・包含に加え、語尾ゆれ
+# （「終わりました」/「終わります」、「園芸学部」/「演技学部」）を
+# 類似度で吸収する。短い文は誤除去しやすいので 8 文字以上に限る。
+BOUNDARY_SIMILARITY = 0.75
+
+
+def _similar(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if len(a) < 8 or len(b) < 8:
+        return False
+    if a in b or b in a:
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= BOUNDARY_SIMILARITY
 
 
 @dataclass
@@ -332,10 +349,7 @@ class Transcriber:
             # 連続セグメント（abs_start == prev_end）に発火しないよう負のマージンを取る
             if abs_start < self._prev_end - 0.3:
                 norm = _norm_text(text)
-                if norm and any(
-                    norm == r or (len(norm) >= 8 and (norm in r or r in norm))
-                    for r in self._recent_texts
-                ):
+                if norm and any(_similar(norm, r) for r in self._recent_texts):
                     self._prev_end = max(self._prev_end, abs_end)
                     continue
             results.append(TranscriptSegment(text=text, start=abs_start, end=abs_end, segment_id=0))

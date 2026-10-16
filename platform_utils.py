@@ -289,10 +289,30 @@ _LINUX_CMDS = {
 
 
 def _tab_condition(target: TabTarget) -> str:
-    """タブ検索条件の AppleScript 行を返す。int=タブid完全一致 / str=URL部分一致。"""
+    """タブ検索条件の AppleScript 行を返す。int=タブid完全一致 / str=URL部分一致。
+
+    タブ id は必ず文字列として比較する。Chrome (155 で実測) の `id of tab` は
+    text で返るため、`id of t is 2144314444` のような整数リテラル比較は
+    一度も一致しない（さらに 2^29 超の整数リテラルは AppleScript 内で real になる）。
+    この 1 行が数値比較だった間、JS 注入・タイトル取得・保存/離脱クリックが
+    すべて無言失敗し「ブラインドモード」になっていた（docs/fix-plan-tab-id.md）。
+    """
     if isinstance(target, int):
-        return f"      if id of t is {target} then"
+        return f'      if (id of t as string) is "{target}" then'
     return f'      if URL of t contains "{target}" then'
+
+
+# タブ未発見を JS の空結果と区別するための番兵。
+_NO_TAB_SENTINEL = "__NO_TAB__"
+_no_tab_warned: set[TabTarget] = set()
+
+
+def _warn_no_tab(target: TabTarget) -> None:
+    """対象タブが見つからなかったことを target ごとに 1 回だけ警告する。"""
+    if target in _no_tab_warned:
+        return
+    _no_tab_warned.add(target)
+    _logger.warning("tab not found: %r (JS 注入・終了検出が機能しません)", target)
 
 
 def _run_js_in_tab(js: str, target: TabTarget, browser: str = "chrome") -> str:
@@ -309,12 +329,17 @@ def _run_js_in_tab(js: str, target: TabTarget, browser: str = "chrome") -> str:
         "      end if",
         "    end repeat",
         "  end repeat",
+        f'  return "{_NO_TAB_SENTINEL}"',
         "end tell",
     ]
     result = _osascript("\n".join(lines), timeout=10)
     if result is None or result.returncode != 0:
         return ""
-    return result.stdout.strip()
+    out = result.stdout.strip()
+    if out == _NO_TAB_SENTINEL:
+        _warn_no_tab(target)
+        return ""
+    return out
 
 
 def navigate_to_url(url: str, browser: str = "chrome") -> None:
@@ -488,11 +513,95 @@ def get_moodle_page_info(target: TabTarget, browser: str = "chrome") -> tuple[st
     return (title or None), page_url
 
 
+_VIDEO_PLAYING_JS = (
+    # iframe を再帰探索して video の再生状態を返す: 'playing' / 'paused' / 'no_video'
+    "(function(){"
+    "function _f(w,d){if(d>4)return null;"
+    "try{var v=w.document.querySelector('video');if(v)return v;}catch(e){}"
+    "try{for(var i=0;i<w.frames.length;i++){var r=_f(w.frames[i],d+1);if(r)return r;}}catch(e){}"
+    "return null;}"
+    "var v=_f(window,0);"
+    "if(!v)return 'no_video';"
+    "return (v.paused||v.ended)?'paused':'playing';"
+    "})()"
+)
+
+
+def get_video_playing(target: TabTarget, browser: str = "chrome") -> bool | None:
+    """video が実際に再生中か。True/False、video に到達できなければ None。"""
+    raw = _run_js_in_tab(_VIDEO_PLAYING_JS, target, browser)
+    if raw == "playing":
+        return True
+    if raw == "paused":
+        return False
+    return None
+
+
+# CoreGraphics でマウスクリックを投稿する JXA。
+# System Events の `click at {x, y}` は macOS 26 (Darwin 25) で座標を無視し、
+# 常に同じ固定点に着弾することを実測した（2026-10-16・docs/fix-plan-tab-id.md）。
+# CGEventPost は指定座標に正確に届き、Chrome は trusted なユーザー操作として
+# 扱う（autoplay policy の解除に必要）。追加依存なし（osascript -l JavaScript）。
+_CG_CLICK_JXA = """ObjC.import('CoreGraphics');
+var p = $.CGPointMake(%d, %d);
+var mv = $.CGEventCreateMouseEvent(null, $.kCGEventMouseMoved, p, $.kCGMouseButtonLeft);
+var dn = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseDown, p, $.kCGMouseButtonLeft);
+var up = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseUp, p, $.kCGMouseButtonLeft);
+$.CGEventPost($.kCGHIDEventTap, mv); delay(0.05);
+$.CGEventPost($.kCGHIDEventTap, dn); delay(0.05);
+$.CGEventPost($.kCGHIDEventTap, up);
+'ok';"""
+
+
+def _cg_click(x: int, y: int) -> bool:
+    """画面座標 (x, y) に CoreGraphics の左クリックを投稿する。成功時 True。"""
+    try:
+        r = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", _CG_CLICK_JXA % (x, y)],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        _logger.warning("cg click failed: %s", e)
+        return False
+    if r.returncode != 0 or "ok" not in r.stdout:
+        _logger.warning("cg click failed rc=%s: %s", r.returncode, r.stderr.strip()[:120])
+        return False
+    return True
+
+
+def _wait_frontmost(app: str, timeout: float = 2.0) -> bool:
+    """app が最前面になるまで待つ（activate 直後のクリック取りこぼし防止）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        r = _osascript(
+            'tell application "System Events" to return name of first application process whose frontmost is true',
+            timeout=5,
+        )
+        if r is not None and r.returncode == 0 and r.stdout.strip() == app:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _wait_playing(target: TabTarget, browser: str, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if get_video_playing(target, browser) is True:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.3)
+
+
 def trigger_video_play(target: TabTarget, browser: str = "chrome") -> bool:
     """
-    Moodle タブの動画再生を開始する。成功時 True。
-    macOS: AppleScript で実際のマウスクリックをシミュレートする（autoplay policy 回避）。
+    Moodle タブの動画再生を開始する。**実際に再生が始まったことを確認して** True。
+    macOS: CoreGraphics で実クリック → video.play() → paused=false を実測。
     非macOS: v.play() を直接呼ぶ（フォールバック）。
+
+    以前は「クリック API が 0 を返した」だけで True を返しており、
+    クリックが動画に当たらず autoplay policy で play() が拒否されても
+    成功扱いになっていた（録音だけ走って空ファイルができる）。
     """
     if SYSTEM != "Darwin":
         raw = _run_js_in_tab(_PLAY_VIDEO_JS, target, browser)
@@ -504,21 +613,27 @@ def trigger_video_play(target: TabTarget, browser: str = "chrome") -> bool:
     if not raw or "," not in raw:
         return False
     try:
-        x, y = raw.strip().split(",")
-        # Step1: OS レベルクリックでユーザージェスチャーを Chrome に登録する
-        script = (
-            f'tell application "{app}" to activate\n'
-            f'delay 0.3\n'
-            f'tell application "System Events" to click at {{{int(float(x))}, {int(float(y))}}}'
-        )
-        result = _osascript(script, timeout=10)
-        if result is None or result.returncode != 0:
-            return False
-        # Step2: ユーザージェスチャー登録後に video.play() を JS で呼ぶ
-        # クリック座標がボタンに当たらない場合でもこちらで再生を保証する
+        x, y = (int(float(v)) for v in raw.strip().split(","))
+        # Step1: 最前面にしてから OS レベルクリック（ユーザージェスチャー登録）
+        _osascript(f'tell application "{app}" to activate', timeout=10)
+        if not _wait_frontmost(app):
+            _logger.debug("trigger_video_play: %s not frontmost after activate", app)
+        if not _cg_click(x, y):
+            # フォールバック: 旧来の System Events クリック
+            r = _osascript(f'tell application "System Events" to click at {{{x}, {y}}}', timeout=10)
+            if r is None or r.returncode != 0:
+                return False
         time.sleep(0.5)
-        _run_js_in_tab(_PLAY_VIDEO_JS, target, browser)
-        return True
+        if _wait_playing(target, browser, timeout=1.0):
+            return True
+        # Step2: クリックで再生が始まらなければ play() を呼ぶ
+        res = _run_js_in_tab(_PLAY_VIDEO_JS, target, browser)
+        _logger.debug("trigger_video_play play()=%r", res)
+        ok = _wait_playing(target, browser, timeout=2.0)
+        if not ok:
+            _logger.warning("trigger_video_play: click+play() did not start playback (state=%s)",
+                            get_video_playing(target, browser))
+        return ok
     except Exception as e:
         _logger.debug("trigger_video_play exception: %s", e)
         return False
@@ -603,6 +718,7 @@ class WindowKeepAlive:
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+        _logger.debug("keep-alive started target=%r", self._target)
         pat = f" (タブ: {self._target})" if self._target is not None else ""
         save_info = f", 保存:{self._save_interval:.0f}秒毎" if self._save_interval > 0 else ""
         print(f"ウィンドウキープアライブ: {self._browser}{pat} ({self._interval}秒ごと{save_info})")

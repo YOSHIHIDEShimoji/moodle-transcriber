@@ -229,10 +229,10 @@ def _trigger_with_retry(target: "TabTarget", browser: str, attempts: int = 5, in
         if trigger_video_play(target, browser):
             logger.info("video play triggered (attempt %d)", i + 1)
             return
-        logger.warning("trigger_video_play: no_video (attempt %d/%d)", i + 1, attempts)
+        logger.warning("trigger_video_play: not started (attempt %d/%d)", i + 1, attempts)
         if i < attempts - 1:
             time.sleep(interval)
-    print("  警告: 動画が見つかりませんでした。手動で再生してください。")
+    print("  警告: 動画の再生を開始できませんでした。手動で再生してください。")
     logger.warning("trigger_video_play: gave up after %d attempts", attempts)
 
 
@@ -347,6 +347,10 @@ class PlaybackMonitor:
     SILENCE_RETRIGGER = 4    # 一度も音が出ないとき再生リトライを打つ無音数（約2分）
     SILENCE_NO_AUDIO = 12    # 一度も音が出ないまま諦めるまでの無音数（約6分）
     BLIND_WARN_POLLS = 10    # 全シグナル不能の警告を出すまでの poll 数
+    NOT_STARTED_RETRIGGER = 2  # currentTime が 0 のままの poll 数 → 再生リトライ（約1分ごと）
+    NOT_STARTED_MAX_RETRY = 2  # 未開始リトライの上限
+    NOT_STARTED_GIVEUP = 8     # 未開始のまま諦める poll 数（約4分）
+    STARTED_CUR = 1.0          # これ以上 currentTime が進んだら「再生開始済み」
 
     def __init__(
         self,
@@ -366,6 +370,12 @@ class PlaybackMonitor:
         self._retriggered = False
         self._blind = 0
         self._blind_warned = False
+        self._not_started = 0
+        self._not_started_retries = 0
+        self._max_cur = -1.0
+        # 再生が実際に始まった（currentTime が進んだ）ことを観測したか。
+        # False のまま終了した場合、呼び出し側は「視聴状況を保存」「活動から抜ける」を押さない。
+        self.played = False
 
     def poll(self, silent: bool | None = None, elapsed: float | None = None) -> tuple[bool, str]:
         """1 セグメント（または poll_interval）ごとに呼ぶ。
@@ -385,6 +395,10 @@ class PlaybackMonitor:
         if disp_pct >= 0:
             _print_progress(disp_pct, cur, total)
 
+        # 再生が実際に始まった（currentTime が進んだ / ended を観測した）
+        if cur >= self.STARTED_CUR or ended is True:
+            self.played = True
+
         # ── 一次シグナル: video.ended ────────────────────────────────
         if ended is True:
             return True, "video.ended"
@@ -397,6 +411,44 @@ class PlaybackMonitor:
         else:
             self._near_end = 0
 
+        # ── フォールバック3: 視聴状況 100% が継続 ─────────────────────
+        # 未開始判定より前に置く: 既視聴 (pct=100) の URL で再生が始まらなくても
+        # 4 分待たずに終了する。視聴済みなので保存/離脱クリックは有効 (played=True)。
+        if pct >= 100:
+            self._pct100 += 1
+            if self._pct100 >= self.PCT100_POLLS:
+                self.played = True
+                return True, "視聴状況 100%"
+        else:
+            self._pct100 = 0
+
+        # ── 再生未開始: currentTime が 0 付近のまま動かない ───────────
+        # 停滞（フォールバック2）と区別する。未開始のまま「視聴完了」扱いにすると
+        # 空ファイルを保存して「活動から抜ける」まで押してしまう（2026-10-16 に実測）。
+        if cur >= 0 and not self.played:
+            self._not_started += 1
+            if (self._not_started % self.NOT_STARTED_RETRIGGER == 0
+                    and self._not_started_retries < self.NOT_STARTED_MAX_RETRY
+                    and self._retrigger):
+                self._not_started_retries += 1
+                print("\n  警告: 動画が再生されていません。再生を再試行します...")
+                logger.warning("video not started — retriggering playback (%d/%d)",
+                               self._not_started_retries, self.NOT_STARTED_MAX_RETRY)
+                self._retrigger()
+            if self._not_started >= self.NOT_STARTED_GIVEUP:
+                return True, "再生を開始できないため中止"
+            self._last_cur = cur
+            return False, ""
+
+        # ── 末尾到達後の巻き戻し: SCORM プレーヤーは終了時に ended を立てず
+        # currentTime を 0 に戻すことがある（2026-10-16 実測: 258s → 0s）。
+        # 停滞判定（約 75 秒）を待たずに終了扱いにする。
+        if cur >= 0:
+            self._max_cur = max(self._max_cur, cur)
+            if (self.played and total > 0 and self._max_cur >= total - 5.0
+                    and cur < self.STARTED_CUR):
+                return True, "動画末尾に到達（巻き戻し検出）"
+
         # ── フォールバック2: currentTime の停滞（再生が止まったまま）──
         if cur >= 0:
             if self._last_cur >= 0 and abs(cur - self._last_cur) < 0.5:
@@ -406,14 +458,6 @@ class PlaybackMonitor:
             self._last_cur = cur
             if self._stall >= self.STALL_POLLS:
                 return True, "再生停止（currentTime 停滞）"
-
-        # ── フォールバック3: 視聴状況 100% が継続 ─────────────────────
-        if pct >= 100:
-            self._pct100 += 1
-            if self._pct100 >= self.PCT100_POLLS:
-                return True, "視聴状況 100%"
-        else:
-            self._pct100 = 0
 
         # ── フォールバック4: 無音の継続（文字起こしモードのみ）────────
         if silent is not None:
@@ -488,6 +532,7 @@ def _process_one_url(
     target, url_pattern, actual_url = _resolve_tab_target(url, browser)
 
     page_title, page_url = get_moodle_page_info(target, browser)
+    logger.debug("page info resolved title=%r", page_title)
 
     fmt = OutputFormat(args.format)
     now = datetime.now()
@@ -517,6 +562,7 @@ def _process_one_url(
 
     print(f"\n{_BGRN('▶  録音開始')}  {_DIM('Ctrl+C で全停止')}\n")
     capture.start()
+    logger.debug("capture started")
     keep_alive.start()
     _trigger_with_retry(target, browser)
 
@@ -545,9 +591,12 @@ def _process_one_url(
                 # 残った tick が play() を注入して動画を再開させることがある。
                 keep_alive.mark_ended()
                 keep_alive.stop()
-                click_save_button(target, browser)
-                time.sleep(1)
-                click_exit_activity_button(target, browser)
+                if monitor.played:
+                    click_save_button(target, browser)
+                    time.sleep(1)
+                    click_exit_activity_button(target, browser)
+                else:
+                    logger.warning("video never played — skipping save/exit clicks")
                 capture.stop()
                 break
     finally:
@@ -615,9 +664,12 @@ def _keep_active_one_url(
                 logger.info("keep-active stopping: %s", reason)
                 keep_alive.mark_ended()
                 keep_alive.stop()
-                click_save_button(target, browser)
-                time.sleep(1)
-                click_exit_activity_button(target, browser)
+                if monitor.played:
+                    click_save_button(target, browser)
+                    time.sleep(1)
+                    click_exit_activity_button(target, browser)
+                else:
+                    logger.warning("video never played — skipping save/exit clicks")
                 break
     finally:
         keep_alive.stop()
@@ -879,9 +931,12 @@ def run(args: argparse.Namespace) -> int:
                     if keep_alive:
                         keep_alive.mark_ended()
                         keep_alive.stop()
-                    click_save_button(target, args.keep_active)
-                    time.sleep(1)
-                    click_exit_activity_button(target, args.keep_active)
+                    if monitor.played:
+                        click_save_button(target, args.keep_active)
+                        time.sleep(1)
+                        click_exit_activity_button(target, args.keep_active)
+                    else:
+                        logger.warning("video never played — skipping save/exit clicks")
                     capture.stop()
                     break
     finally:

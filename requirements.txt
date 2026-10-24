@@ -11,3 +11,7 @@ requests>=2.31; sys_platform == "darwin"
 faster-whisper==1.2.1; sys_platform != "darwin"
 scipy>=1.11
 tqdm>=4.66
+
+# page エンジン（既定）: 専用 Chrome を別プロファイルで起動しページ内で音声を取る。
+# ブラウザ本体は system の Google Chrome を使うので `playwright install` は不要。
+playwright>=1.47

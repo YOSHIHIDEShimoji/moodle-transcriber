@@ -3,9 +3,11 @@
 import argparse
 import logging
 import logging.handlers
+import os
 import platform
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -20,6 +22,7 @@ import numpy as np
 from capture import create_capture, find_loopback_device, list_all_devices
 from output import OutputFormat, OutputWriter, _fmt_ts
 from platform_utils import (
+    warn_other_audio_apps,
     TabTarget,
     WindowKeepAlive,
     click_exit_activity_button,
@@ -39,17 +42,20 @@ from platform_utils import (
     wait_for_page_ready,
 )
 from transcriber import is_silent
+from qa import qa_metrics, write_run_summary, format_qa_line
 
 # faster-whisper のロードを遅延させるため Transcriber は使う直前に import する。
 # --no-transcribe 時はモデル読み込みコスト（数百MB）を避けたい。
 if TYPE_CHECKING:
     from transcriber import Transcriber
+    from browser import BrowserSession
 
 SYSTEM = platform.system()
 
 
 def _setup_logging() -> logging.Logger:
-    log_dir = Path("logs")
+    # テストや別環境からログ先を差し替えられるようにする（本番ログに偽シグネチャを混ぜない）
+    log_dir = Path(os.environ.get("MOODLE_TRANSCRIBER_LOG_DIR", "logs"))
     log_dir.mkdir(exist_ok=True)
     handler = logging.handlers.RotatingFileHandler(
         log_dir / "moodle-transcriber.log",
@@ -210,6 +216,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-v", "--verbose", action="store_true", help="詳細ログを表示")
     p.add_argument(
+        "--engine", choices=["page", "blackhole"], default="page",
+        help="page: 専用 Chrome（別プロファイル）を Playwright で動かしページ内で音声を取る（既定・ユーザーの Chrome に触らない） / "
+             "blackhole: 従来方式（ユーザーの Chrome を AppleScript で操作し BlackHole で録音）",
+    )
+    p.add_argument(
+        "--profile-dir", default=None,
+        help="page エンジンの Chrome プロファイル（既定: ~/.moodle-transcriber/chrome-profile）",
+    )
+    p.add_argument("--headless", action="store_true", help="page エンジンのブラウザを非表示で起動（ログインが必要なときは使えない）")
+    p.add_argument(
+        "--login-timeout", type=float, default=600.0,
+        help="page エンジンでログイン画面に落ちたとき、本人のログインを待つ秒数（既定 600）",
+    )
+    p.add_argument(
+        "--player-marker", default="player.php",
+        help="page エンジンで『プレーヤーページに到達した』と判定する URL の部分文字列（既定 player.php）",
+    )
+    p.add_argument(
+        "--json-summary", metavar="PATH", default=None,
+        help="複数 URL モードの実行サマリー(JSON)の出力先（デフォルト: 出力ディレクトリ/run-summary.json）",
+    )
+    p.add_argument(
         "--no-transcribe",
         action="store_true",
         help="文字起こしせず Chrome タブの自動再生・視聴管理だけ行う（URL必須）",
@@ -357,10 +385,14 @@ class PlaybackMonitor:
         target: "TabTarget",
         browser: str,
         retrigger: "Callable[[], None] | None" = None,
+        probe: "object | None" = None,
     ):
+        """probe: pct() / ended() / time() を持つオブジェクト。None なら従来の
+        AppleScript 経路（platform_utils の関数）を使う。page エンジンは BrowserSession を渡す。"""
         self._target = target
         self._browser = browser
         self._retrigger = retrigger
+        self._probe = probe
         self._last_cur = -1.0
         self._stall = 0
         self._near_end = 0
@@ -373,6 +405,7 @@ class PlaybackMonitor:
         self._not_started = 0
         self._not_started_retries = 0
         self._max_cur = -1.0
+        self.total = -1.0   # 直近に観測した動画総尺（秒）。QA の分母に使う
         # 再生が実際に始まった（currentTime が進んだ）ことを観測したか。
         # False のまま終了した場合、呼び出し側は「視聴状況を保存」「活動から抜ける」を押さない。
         self.played = False
@@ -382,11 +415,18 @@ class PlaybackMonitor:
 
         Returns: (終了すべきか, 理由)
         """
-        pct = get_viewing_percentage(self._target, self._browser)
-        ended = get_video_ended(self._target, self._browser)
-        cur, total = get_video_time(self._target, self._browser)
+        if self._probe is not None:
+            pct = self._probe.pct()
+            ended = self._probe.ended()
+            cur, total = self._probe.time()
+        else:
+            pct = get_viewing_percentage(self._target, self._browser)
+            ended = get_video_ended(self._target, self._browser)
+            cur, total = get_video_time(self._target, self._browser)
         logger.debug("poll: pct=%d ended=%s cur=%.1f total=%.1f silent=%s elapsed=%s",
                      pct, ended, cur, total, silent, elapsed)
+        if total > 0:
+            self.total = total
 
         # 進捗表示（pct が取れなければ currentTime/duration から算出）
         disp_pct = pct
@@ -518,7 +558,8 @@ def _process_one_url(
     device_name: str,
     current: dict,
     stop_event: threading.Event,
-) -> None:
+) -> dict:
+    """1 本処理して結果 dict（url/title/output/qa など）を返す。run-summary.json の 1 エントリ。"""
     browser = args.keep_active
 
     print(f"\n{_BOLD(f'[{idx+1}/{total}]')} {_CYN(url)}")
@@ -568,6 +609,10 @@ def _process_one_url(
 
     monitor = PlaybackMonitor(target, browser,
                               retrigger=lambda: _trigger_with_retry(target, browser))
+    texts: list[str] = []
+    stop_reason = ""
+    elapsed = 0.0
+    started_at = time.monotonic()
     try:
         for segment in capture.segments():
             if stop_event.is_set():
@@ -582,9 +627,11 @@ def _process_one_url(
                     prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
                     print(f"{prefix}{r.text}")
                     writer.append(r)
+                    texts.append(r.text)
             elapsed = segment.start_time + len(segment.data) / 16000.0
             should_stop, reason = monitor.poll(silent=silent, elapsed=elapsed)
             if should_stop:
+                stop_reason = reason
                 print(f"\n{_BGRN('視聴完了')} ({reason}) — 保存中...")
                 logger.info("stopping: %s", reason)
                 # 先に keep-alive を止める（join 込み）。止めずに保存→離脱すると
@@ -604,16 +651,37 @@ def _process_one_url(
         capture.stop()   # 冪等。例外経路でもストリームを確実に閉じる
         writer.finalize()
 
-    if not stop_event.is_set():
+    interrupted = stop_event.is_set()
+    if not interrupted:
         output_path = _prompt_rename(output_path)
+    qa = qa_metrics(texts, monitor.total, monitor.played, stop_reason)
+    if interrupted:
+        qa["status"] = "interrupted"
+        qa["warnings"].append("Ctrl+C で中断")
+    entry = {
+        "index": idx,
+        "url": url,
+        "page_url": page_url or url,
+        "title": page_title,
+        "output": str(output_path),
+        "stop_reason": stop_reason,
+        "played": monitor.played,
+        "elapsed_seconds": round(time.monotonic() - started_at, 1),
+        "qa": qa,
+    }
+    logger.info("qa: %s", {k: v for k, v in qa.items() if k != "warnings"})
+    for w in qa["warnings"]:
+        logger.warning("qa: %s", w)
     _title = _BGRN(page_title) if page_title else _DIM(url)
     print(f"\n  {_BGRN('✔')}  {_title}  {_BGRN('done!')}")
     print(f"  {_DIM('URL')}   {_DIM(page_url or url)}")
     print(f"  {_DIM('保存')}  {_CYN(str(output_path))}")
+    print(format_qa_line(entry))
     if idx + 1 < total:
         print(f"  {_DIM(f'[{idx+2}/{total}] 次の URL へ...')}")
     current["keep_alive"] = None
     current["capture"] = None
+    return entry
 
 
 def _keep_active_one_url(
@@ -709,13 +777,291 @@ def _run_keep_active_batch(urls: list[str], args: argparse.Namespace) -> int:
     return 0
 
 
+
+PAGE_VIDEO_WAIT = 30.0    # video 要素の出現を待つ秒数
+PAGE_POLL_EXTRA = 5.0     # 音声チャンクが来ないとき状態を見に行く間隔 = segment_duration + これ
+
+
+class _SessionProbe:
+    """PlaybackMonitor 用: BrowserSession から pct / ended / time を読む。"""
+
+    def __init__(self, session: "BrowserSession"):
+        self._s = session
+
+    def pct(self) -> int:
+        try:
+            return self._s.viewing_percentage()
+        except Exception:  # noqa: BLE001
+            return -1
+
+    def ended(self) -> bool | None:
+        try:
+            st = self._s.state()
+        except Exception:  # noqa: BLE001
+            return None
+        return st.ended if st.found else None
+
+    def time(self) -> tuple[float, float]:
+        try:
+            st = self._s.state()
+        except Exception:  # noqa: BLE001
+            return -1.0, -1.0
+        if not st.found:
+            return -1.0, -1.0
+        return st.current_time, st.duration
+
+
+def _page_play_with_retry(session: "BrowserSession", attempts: int = 5, settle: float = 0.5) -> bool:
+    """video.play() を呼び、実際に paused=false になったことを確認する。"""
+    for i in range(attempts):
+        res = session.play()
+        logger.debug("page play() -> %r (attempt %d)", res, i + 1)
+        for _ in range(6):
+            time.sleep(settle)
+            st = session.state()
+            if st.playing:
+                logger.info("video play triggered (attempt %d)", i + 1)
+                return True
+        logger.warning("trigger_video_play: not started (attempt %d/%d)", i + 1, attempts)
+        time.sleep(2.0)
+    print("  警告: 動画の再生を開始できませんでした。")
+    logger.warning("trigger_video_play: gave up after %d attempts", attempts)
+    return False
+
+
+def _process_one_url_page(
+    url: str,
+    idx: int,
+    total: int,
+    transcriber: "Transcriber",
+    args: argparse.Namespace,
+    session: "BrowserSession",
+    stop_event: threading.Event,
+) -> dict:
+    """page エンジン: 専用 Chrome で 1 本処理して結果 dict を返す。
+
+    BlackHole 版 `_process_one_url` と同じ entry 形式。違いは
+    - 遷移・再生・状態取得・保存/離脱クリックが BrowserSession（Playwright）
+    - 音声が PageAudioCapture（ページ内 Web Audio → binding）
+    - ログイン画面に落ちたら本人のログインを待つ
+    """
+    from page_capture import PageAudioCapture
+
+    print(f"\n{_BOLD(f'[{idx+1}/{total}]')} {_CYN(url)}")
+    transcriber.reset()
+    started_at = time.monotonic()
+
+    def _entry(page_title, page_url, output_path, texts, stop_reason, played, video_seconds, extra_warn=None):
+        qa = qa_metrics(texts, video_seconds, played, stop_reason)
+        if stop_event.is_set():
+            qa["status"] = "interrupted"
+            qa["warnings"].append("Ctrl+C で中断")
+        if extra_warn:
+            qa["warnings"].append(extra_warn)
+        entry = {
+            "index": idx, "url": url, "page_url": page_url or url, "title": page_title,
+            "output": str(output_path) if output_path else None, "stop_reason": stop_reason,
+            "played": played, "elapsed_seconds": round(time.monotonic() - started_at, 1), "qa": qa,
+        }
+        logger.info("qa: %s", {k: v for k, v in qa.items() if k != "warnings"})
+        for w in qa["warnings"]:
+            logger.warning("qa: %s", w)
+        return entry
+
+    # ── 遷移（ログイン待ちを含む） ──
+    session.set_chunk_sink(None)
+    session.goto(url)
+    print("  ページ読み込み中...")
+
+    def _on_login(login_url: str) -> None:
+        print(_YLW("  Moodle がログイン画面です。専用ブラウザのウィンドウでログインしてください"
+                   f"（{int(args.login_timeout // 60)} 分待ちます）"))
+        logger.info("login required: %s", login_url)
+
+    actual_url = session.wait_for_player(contains=getattr(args, "player_marker", "player.php"),
+                                         timeout=60.0, login_timeout=args.login_timeout,
+                                         on_login_required=_on_login, should_abort=stop_event.is_set)
+    if stop_event.is_set():
+        return _entry(None, session.url(), None, [], "", False, -1.0)
+    if actual_url is None:
+        logger.warning("page: player not reached for %s (url=%s)", url, session.url())
+        print(_YLW("  プレーヤーに到達できませんでした（ログイン待ちタイムアウト or 想定外のページ）"))
+        return _entry(None, session.url(), None, [], "プレーヤー到達失敗", False, -1.0)
+    logger.info("target resolved (page engine): %s", actual_url)
+
+    # video 要素の出現を待つ（SCORM iframe の読み込み）
+    deadline = time.monotonic() + PAGE_VIDEO_WAIT
+    while not session.has_video() and time.monotonic() < deadline:
+        session.pump(500)
+    raw_title = session.title() or ""
+    page_title = (raw_title.split("|")[0].strip() or None) if raw_title else None
+    page_url = actual_url
+    logger.debug("page info resolved title=%r", page_title)
+
+    fmt = OutputFormat(args.format)
+    now = datetime.now()
+    out_dir = Path(args.output) if args.output else Path("out") / now.strftime("%Y%m%d")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filename = _sanitize_filename(page_title) if page_title else f"lecture_{now.strftime('%H%M%S')}"
+    output_path = _unique_path(out_dir / f"{filename}.{fmt.value}")
+
+    info_rows: list[tuple[str, str]] = []
+    if page_title:
+        info_rows.append(("ページ", _GRN(page_title)))
+    info_rows.append(("エンジン", _CYN("page（専用 Chrome / ページ内キャプチャ）")))
+    info_rows.append(("出力", _CYN(str(output_path))))
+    _print_session_info(info_rows)
+
+    writer = OutputWriter(output_path, fmt, args.model, args.language,
+                          title=page_title, page_url=page_url,
+                          backend=getattr(transcriber, "backend_desc", None))
+    capture = PageAudioCapture(args.segment_duration, args.overlap)
+    capture.start()
+    session.set_chunk_sink(capture.feed_b64)
+    cap_res = session.start_capture()
+    logger.info("page capture: %s", cap_res)
+    if cap_res == "no_video":
+        writer.finalize()
+        print(_YLW("  動画要素が見つかりませんでした"))
+        return _entry(page_title, page_url, output_path, [], "動画要素なし", False, -1.0)
+    m_sr = re.search(r"sr=(\d+)", cap_res or "")
+    if m_sr and int(m_sr.group(1)) != 16000:
+        # AudioContext が 16kHz を拒否して既定レートで動いている。Python 側は 16kHz 前提なので
+        # 速度違いの音声になり文字起こしが壊れる。偽成功にせず失敗で止める。
+        writer.finalize()
+        logger.warning("page capture sample rate mismatch: %s", cap_res)
+        print(_YLW(f"  キャプチャのサンプルレートが 16kHz ではありません ({cap_res})"))
+        return _entry(page_title, page_url, output_path, [], f"キャプチャのサンプルレート不一致 ({cap_res})", False, -1.0)
+
+    print(f"\n{_BGRN('▶  文字起こし開始')}  {_DIM('Ctrl+C で全停止')}\n")
+    _page_play_with_retry(session)
+
+    probe = _SessionProbe(session)
+    monitor = PlaybackMonitor(url, "page", retrigger=lambda: _page_play_with_retry(session), probe=probe)
+    texts: list[str] = []
+    stop_reason = ""
+    last_save = time.monotonic()
+    loop_started = time.monotonic()   # elapsed の基準（ログイン待ち時間を watchdog に含めない）
+    poll_timeout = getattr(args, "page_poll_timeout", None) or max(5.0, args.segment_duration + PAGE_POLL_EXTRA)
+    stopping = False
+    try:
+        while True:
+            if stop_event.is_set() and not stopping:
+                stopping = True
+                capture.stop()
+            segment = capture.next_segment(timeout=poll_timeout)
+            if segment is None:
+                if stopping or stop_event.is_set():
+                    break
+                # 音声チャンクが届かない（ページが止まった等）: 無音セグメント相当として判定だけ進める
+                logger.debug("page: no audio chunk for %.0fs — polling playback state", poll_timeout)
+                elapsed = time.monotonic() - loop_started
+                should_stop, reason = monitor.poll(silent=True, elapsed=elapsed)
+                if should_stop:
+                    stop_reason = reason
+                    print(f"\n{_BGRN('視聴完了')} ({reason}) — 保存中...")
+                    logger.info("stopping: %s", reason)
+                    stopping = True
+                    try:
+                        session.stop_capture()
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("stop_capture: %s", e)
+                    capture.stop()
+                continue
+            silent = is_silent(segment.data)
+            if args.verbose:
+                print(f"[セグメント {segment.segment_id}] {segment.start_time:.1f}秒〜"
+                      + (" (無音スキップ)" if silent else ""))
+            if not silent:
+                results = transcriber.transcribe(segment.data, time_offset=segment.start_time)
+                for r in results:
+                    prefix = f"{_DIM(f'[{_fmt_ts(r.start)}]')} " if args.timestamps else ""
+                    print(f"{prefix}{r.text}")
+                    writer.append(r)
+                    texts.append(r.text)
+            if stopping:
+                continue   # 停止決定後は残りセグメントを流し切るだけ
+            elapsed = segment.start_time + len(segment.data) / 16000.0
+            should_stop, reason = monitor.poll(silent=silent, elapsed=elapsed)
+            if args.save_interval > 0 and time.monotonic() - last_save >= args.save_interval:
+                session.click_save()
+                last_save = time.monotonic()
+            if should_stop:
+                stop_reason = reason
+                print(f"\n{_BGRN('視聴完了')} ({reason}) — 保存中...")
+                logger.info("stopping: %s", reason)
+                stopping = True
+                try:
+                    session.stop_capture()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("stop_capture: %s", e)
+                capture.stop()   # 残りバッファを最終セグメントとして流し、終端を入れる
+    finally:
+        session.set_chunk_sink(None)
+        capture.stop()
+        writer.finalize()
+
+    if stop_reason and monitor.played and not stop_event.is_set():
+        session.click_save()
+        time.sleep(1)
+        session.click_exit()
+    elif stop_reason and not monitor.played:
+        logger.warning("video never played — skipping save/exit clicks")
+
+    if not stop_event.is_set():
+        output_path = _prompt_rename(output_path)
+    entry = _entry(page_title, page_url, output_path, texts, stop_reason, monitor.played, monitor.total)
+    entry["audio_seconds_received"] = round(capture.seconds_received, 1)
+    if monitor.played and monitor.total > 0 and capture.seconds_received < monitor.total * 0.5:
+        entry["qa"]["warnings"].append(
+            f"届いた音声が動画長の半分未満: {capture.seconds_received:.0f}s / {monitor.total:.0f}s")
+        if entry["qa"]["status"] == "ok":
+            entry["qa"]["status"] = "warn"
+    _title = _BGRN(page_title) if page_title else _DIM(url)
+    print(f"\n  {_BGRN('✔')}  {_title}  {_BGRN('done!')}")
+    print(f"  {_DIM('URL')}   {_DIM(page_url)}")
+    print(f"  {_DIM('保存')}  {_CYN(str(output_path))}")
+    print(format_qa_line(entry))
+    if idx + 1 < total:
+        print(f"  {_DIM(f'[{idx+2}/{total}] 次の URL へ...')}")
+    return entry
+
+
+COURSE_PAGE_TEXT_JS = (
+    "(() => { const m = document.querySelector('#region-main') || document.querySelector('main') || document.body;"
+    " return (document.title || '') + String.fromCharCode(10) + (m ? m.innerText : ''); })()"
+)
+
+
+def _dump_course_page(session: "BrowserSession", out_dir: Path) -> Path | None:
+    """最後の『活動から抜ける』でコースページに居れば本文を course-page.txt に保存する。
+
+    スキルが課題の有無を判定する材料。専用ブラウザは実行後に閉じるので、ここで取っておく。
+    """
+    try:
+        url = session.url()
+        if "course/view.php" not in url:
+            logger.info("course page not reached (url=%s); skip dump", url)
+            return None
+        text = session.evaluate(COURSE_PAGE_TEXT_JS) or ""
+        path = out_dir / "course-page.txt"
+        path.write_text(f"# URL: {url}\n{text}", encoding="utf-8")
+        logger.info("course page dumped: %s", path)
+        return path
+    except Exception as e:  # noqa: BLE001
+        logger.warning("course page dump failed: %s", e)
+        return None
+
+
 def _run_batch(
     urls: list[str],
     args: argparse.Namespace,
-    device_index: int | None,
-    device_name: str,
-    routing_changed: bool,
+    device_index: int | None = None,
+    device_name: str = "",
+    routing_changed: bool = False,
+    session: "BrowserSession | None" = None,
 ) -> int:
+    """複数 URL を順に処理する。session があれば page エンジン、無ければ BlackHole エンジン。"""
     print(f"\n{_BOLD(f'{len(urls)} 件の講義を順次処理します')}")
     print("  Whisperモデルを読み込み中...")
 
@@ -740,32 +1086,69 @@ def _run_batch(
 
     signal.signal(signal.SIGINT, handle_sigint)
 
+    entries: list[dict] = []
+    # 出力ディレクトリは URL 処理と同じ規則で先に決める（1 本目が失敗して output=None でも書ける）
+    out_dir = Path(args.output) if getattr(args, "output", None) else Path("out") / datetime.now().strftime("%Y%m%d")
+    summary_path = Path(args.json_summary) if getattr(args, "json_summary", None) else out_dir / "run-summary.json"
+
+    def _flush_summary(finished: bool) -> None:
+        if not entries:
+            return
+        try:
+            write_run_summary(summary_path, entries, finished)
+        except OSError as e:
+            logger.warning("run-summary の書き出しに失敗: %s", e)
+
+    completed = False   # 全 URL を回り切ったときだけ True（例外・中断では False のまま）
     try:
         for i, url in enumerate(urls):
             if stop_event.is_set():
                 break
-            _process_one_url(url, i, len(urls), transcriber, args,
-                             device_index, device_name, current, stop_event)
+            if session is not None:
+                entry = _process_one_url_page(url, i, len(urls), transcriber, args, session, stop_event)
+            else:
+                entry = _process_one_url(url, i, len(urls), transcriber, args,
+                                         device_index, device_name, current, stop_event)
+            if entry is not None:
+                entries.append(entry)
+                _flush_summary(finished=False)   # クラッシュ・中断に備えて URL ごとに書く
             if not stop_event.is_set() and i < len(urls) - 1:
                 print(f"\n  次の URL まで {_DIM('5秒待機...')}")
                 time.sleep(5)
+        completed = not stop_event.is_set()
+        if session is not None and entries:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            _dump_course_page(session, out_dir)
     finally:
         if hasattr(transcriber, "close"):
             transcriber.close()
         if routing_changed:
             restore_audio_output(restore_to=args.restore_to)
+        _flush_summary(finished=completed)
 
+    failed = [e for e in entries if e["qa"]["status"] in ("failed", "interrupted")]
+    warned = [e for e in entries if e["qa"]["status"] == "warn"]
     if not stop_event.is_set():
         if SYSTEM == "Darwin":
-            import subprocess as _sp
-            _sp.run(
+            subprocess.run(
                 ["osascript", "-e",
                  f'display notification "{len(urls)}件の講義を文字起こし完了" with title "moodle-transcriber"'],
                 capture_output=True,
             )
         print(f"\n{_BGRN('全講義の処理が完了しました')} ({len(urls)}件)")
+    if entries:
+        print(f"\n{_BOLD('結果サマリー')}  ok {len(entries) - len(failed) - len(warned)} / "
+              f"warn {len(warned)} / failed {len(failed)}")
+        for e in entries:
+            print(format_qa_line(e))
+        print(f"  {_DIM('サマリー')}  {_CYN(str(summary_path))}")
+    if len(entries) < len(urls):
+        missing = len(urls) - len(entries)
+        print(_YLW(f"  未処理の URL が {missing} 件あります"))
+        logger.warning("batch: %d of %d urls not processed", missing, len(urls))
 
-    return 0
+    # 1 本でも failed（再生できず・空・幻覚のみ・中断）があれば rc=2。後段が再実行を判断する
+    return 2 if failed or len(entries) < len(urls) else 0
 
 
 def run(args: argparse.Namespace) -> int:
@@ -802,10 +1185,34 @@ def run(args: argparse.Namespace) -> int:
             args.keep_active = "chrome"
         return _run_keep_active_batch(targets, args)
 
+    # ── page エンジン（既定）: 専用 Chrome + ページ内キャプチャ。ユーザーの Chrome には触らない ──
+    if args.engine == "page":
+        if not urls and args.moodle_url and args.moodle_url.startswith("http"):
+            urls = [args.moodle_url]
+        if not urls:
+            print("エラー: page エンジンは --urls / --url-file（フル URL）が必要です。"
+                  "従来方式を使う場合は --engine blackhole を指定してください", file=sys.stderr)
+            return 1
+        from browser import BrowserSession, DEFAULT_PROFILE_DIR
+        profile = Path(args.profile_dir).expanduser() if args.profile_dir else DEFAULT_PROFILE_DIR
+        print(f"  専用 Chrome を起動中... {_DIM(str(profile))}")
+        session = BrowserSession(profile_dir=profile, headless=args.headless)
+        try:
+            session.start()
+        except RuntimeError as e:
+            print(f"エラー: {e}", file=sys.stderr)
+            return 1
+        try:
+            return _run_batch(urls, args, session=session)
+        finally:
+            session.close()
+
     # 音声ルーティング自動切替（macOS + SwitchAudioSource がある場合）
     routing_changed = False
     if not args.no_auto_routing:
         routing_changed = setup_audio_for_capture()
+    for app in warn_other_audio_apps():
+        print(_YLW(f"  警告: {app} が再生中です。録音は全システム音声を拾うため文字起こしに混入します。一時停止してください"))
 
     # デバイス検出
     if SYSTEM != "Windows":

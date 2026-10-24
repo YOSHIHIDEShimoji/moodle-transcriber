@@ -3,3 +3,7 @@ __pycache__/
 out/
 logs/
 .python-version
+
+# スキルは repo で管理する（グローバル gitignore の .claude/ を上書き）。ローカル設定だけ除外
+!.claude/
+.claude/settings.local.json

@@ -167,6 +167,32 @@ _VIDEO_ENDED_JS = (
 )
 
 
+# ─── 他アプリの音声再生チェック ────────────────────────────────────────────
+
+_AUDIO_APPS = ("Spotify", "Music")
+
+
+def warn_other_audio_apps() -> list[str]:
+    """再生中の音楽アプリ名を返す（macOS 以外・未起動なら空）。
+
+    録音は Multi-Output Device 経由の全システム音声なので、Spotify 等の音は
+    そのまま文字起こしに混入する（2026-10-16 の実機テストで英語の歌詞が混入）。
+    """
+    if SYSTEM != "Darwin":
+        return []
+    playing: list[str] = []
+    for app in _AUDIO_APPS:
+        r = _osascript(
+            f'if application "{app}" is running then\n'
+            f'  tell application "{app}" to return (player state as string)\n'
+            f'else\n  return "not running"\nend if',
+            timeout=5,
+        )
+        if r is not None and r.returncode == 0 and r.stdout.strip() == "playing":
+            playing.append(app)
+    return playing
+
+
 # ─── osascript 実行の共通ラッパー ─────────────────────────────────────────────
 
 def _osascript(script: str, timeout: float = 10.0) -> subprocess.CompletedProcess | None:

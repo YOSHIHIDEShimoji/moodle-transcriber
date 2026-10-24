@@ -1,13 +1,41 @@
 # moodle-transcriber 使い方
 
 Moodleの講義動画音声をオンデバイス（ローカルAI）で自動文字起こしするツール。
-サーバーへの送信なし、Moodle側のログに影響なし。
+サーバーへの送信なし、Moodle側のログに影響なし。動画はダウンロードしない。
+
+## 2 つのエンジン
+
+| | `--engine page`（既定・2026-10-24〜） | `--engine blackhole`（従来） |
+|---|---|---|
+| ブラウザ | **専用の Chrome**（別プロファイル `~/.moodle-transcriber/chrome-profile`、別プロセス）を Playwright で制御 | あなたの Chrome を AppleScript で操作 |
+| あなたの Chrome | 触らない（前面に出ない・タブ遷移なし・クリックなし） | 前面に出る・タブが遷移する・クリックされる |
+| 再生 | `--autoplay-policy=no-user-gesture-required` で `video.play()` | OS レベルのマウスクリックで autoplay policy を通す |
+| 音声 | **ページ内**で video を Web Audio に繋いで取り出す。スピーカーには出さない | BlackHole + 複数出力装置で全システム音声を録る |
+| 他アプリの音 | 混ざらない（Spotify / YouTube を普通に使える） | 全部混ざる。実行中は止める必要あり |
+| 必要なもの | Google Chrome、`pip install -r requirements.txt`（playwright） | BlackHole、SwitchAudioSource、複数出力装置、Chrome の Apple Events 許可 |
+| ログイン | 専用ブラウザで初回だけ手でログイン（セッションはプロファイルに残る） | あなたの Chrome のログイン済みタブを使う |
+
+page エンジンの使い方:
+
+```bash
+python main.py --urls "https://moodle.gs.chiba-u.jp/moodle/mod/scorm/player.php?a=188066&currentorg&scoid=376188"
+```
+
+初回は専用 Chrome のウィンドウが前面に出て Moodle のログイン画面になるので、そこでログインする
+（`--login-timeout` 秒、既定 10 分待つ）。以後はセッションが残るので無人で進む。
+ウィンドウは画面右上に出る。最小化せずそのままにしておく（別デスクトップに移してもよい）。
+ログイン済みなら `--headless` で非表示にもできる。
+
+ページ内キャプチャなので講義の音はスピーカーから鳴らない。音を聞きたい場合は従来エンジンを使う。
 
 ---
 
 ## 初期セットアップ（1回だけ）
 
-### 1. BlackHole インストール（macOS）
+page エンジン（既定）だけ使うなら、必要なのは 4（Python 環境）と 5（whisper.cpp）だけ。
+1〜3 は従来の blackhole エンジン用。
+
+### 1. BlackHole インストール（macOS・blackhole エンジンのみ）
 
 ```bash
 brew install --cask blackhole-2ch
@@ -80,8 +108,29 @@ export WHISPER_CPP_DIR=/path/to/whisper.cpp
   音声が打ち消されて幻覚だけが出力される。録音時に位相を見て自動で差 (L−R) に切り替える。
 - **終了の確定**: SCORM プレーヤーは終了時に `ended` を立てずに 0 秒へ巻き戻すことがある。
   末尾付近まで再生した後に 0 秒へ戻ったら、その時点で終了とみなす。
-- **録音は全システム音声**: Multi-Output Device 経由なので、実行中に鳴った他アプリの音
+- **録音は全システム音声（blackhole エンジンのみ）**: Multi-Output Device 経由なので、実行中に鳴った他アプリの音
   （音楽・通知音）も文字起こしに混入する。実行中は他アプリの音を止めること。
+  page エンジンはページ内で video の音声だけを取るので、この制約は無い。
+
+---
+
+## Claude スキルで回す（推奨）
+
+Claude Code に Moodle の URL（複数可）を貼って「文字起こしして」と言うだけで、
+`.claude/skills/moodle-transcribe/SKILL.md` の手順で事前確認 → 起動 → 監視 → 検品 →
+失敗分の再実行 → 講義まとめ（課題があれば課題ファイル）→ `~/Downloads` へコピーまで進む。
+Python 本体は変わらない。Claude は「起動・監視・検品・要約」だけを担当する。
+
+Python 側はそのために次を出す:
+
+- `out/YYYYMMDD/run-summary.json`: URL ごとの結果（タイトル・保存先・終了理由・再生したか・
+  自己診断 `qa`）。URL を 1 本処理するごとに書き直されるので、中断してもそこまでは残る。
+- 自己診断 `qa.status`: `ok` / `warn`（字/分が少ない・同一文の連発・中止理由あり）/
+  `failed`（未再生・本文なし・定型句だけ）。終了コードは failed か未処理 URL があれば 2。
+- `--json-summary PATH` でサマリーの出力先を変えられる。
+- `python tab_text.py --pattern course/view.php` で Chrome の該当タブ本文を読む（読み取り専用。
+  コースページの課題確認に使う）。
+- 起動時に Spotify / Music が再生中なら警告する（録音は全システム音声のため）。
 
 ---
 
@@ -217,6 +266,12 @@ out/20260501/
 | `--list-devices` | — | 入力デバイス一覧を表示して終了 |
 | `--timestamps` | — | 各行に `[HH:MM:SS]` タイムスタンプを付与（デフォルト: オフ） |
 | `-v` | — | 詳細ログを表示 |
+| `--json-summary PATH` | `出力ディレクトリ/run-summary.json` | 複数 URL モードの実行サマリー(JSON)の出力先 |
+| `--engine {page,blackhole}` | `page` | page: 専用 Chrome + ページ内キャプチャ / blackhole: 従来方式 |
+| `--profile-dir DIR` | `~/.moodle-transcriber/chrome-profile` | page エンジンの Chrome プロファイル |
+| `--headless` | — | page エンジンのブラウザを非表示で起動（ログインが必要なときは不可） |
+| `--login-timeout 秒` | 600 | page エンジンでログイン画面に落ちたとき本人のログインを待つ秒数 |
+| `--player-marker 文字列` | `player.php` | page エンジンで「プレーヤーに到達した」とみなす URL の部分文字列 |
 
 ---
 

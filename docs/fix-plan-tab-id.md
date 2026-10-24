@@ -194,3 +194,66 @@ corr(L,R) = −0.956。この動画の音声は左右が逆相でエンコード
 
 挙動変更: 既視聴 (pct=100) で再生が始まらない URL は、未開始判定より先に
 「視聴状況 100%」で終了する（旧挙動と同じ 3 poll）。3ch 以上の入力は全 ch 平均に戻す。
+
+---
+
+# 追記 2026-10-24: エンジン切り替え — 専用 Chrome ＋ ページ内キャプチャ（`--engine page`、既定）
+
+本人の要望「Chrome を触られるのがうざい」「文字起こし中に Spotify / YouTube を使いたい」への回答。
+
+| 旧（`--engine blackhole`） | 新（`--engine page`） |
+|---|---|
+| 本人の Chrome を AppleScript で操作（前面化・タブ遷移） | system の Chrome 本体を別プロファイル・別プロセスで起動し Playwright（CDP）で制御。本人の Chrome に触らない |
+| autoplay policy を OS クリックで通す（macOS 26 で System Events が壊れ CGEventPost に置換した箇所） | `--autoplay-policy=no-user-gesture-required` で `video.play()` が通る。クリック不要 |
+| BlackHole + 複数出力装置で全システム音声を録音（Spotify が混入） | ページ内で video → Web Audio（MediaElementSource → ScriptProcessor）→ Playwright binding で PCM を Python へ。destination に繋がないので無音。他アプリの音は混ざらない |
+| 同一オリジン iframe のみ JS が届く | Playwright の frame 評価なので別オリジン iframe にも届く |
+
+実測（ローカル HTTP 配信の逆相ステレオ動画・iframe 内・ヘッドレス）: 起動 4.9 秒、autoplay 成功、
+2 秒ごとにチャンク到着、L/R の RMS 0.2255、corr=−1.000 → `downmix_to_mono` が差を採用し音声保持。
+`file://` の動画は Web Audio が別オリジン扱いで無音になる（Moodle の blob: URL は同一オリジンなので問題なし）。
+
+実装: `browser.py`（BrowserSession: 専用スレッドで Playwright を動かし、他スレッドからコマンドキューで操作）、
+`page_capture.py`（base64 int16 ステレオ → 30 秒セグメント。`capture.downmix_to_mono` を共有）、
+`main._process_one_url_page` / `_SessionProbe` / `_page_play_with_retry`、`PlaybackMonitor(probe=...)`。
+旧経路は `--engine blackhole` としてそのまま残す。
+
+ログイン: 初回は専用ブラウザがログイン画面になるので本人がログインする（`--login-timeout`、既定 10 分）。
+セッションはプロファイルに残る。Claude はログインしない。
+
+テスト: [39]〜[42]。[41] は実 Chrome（ヘッドレス・一時プロファイル）でローカル動画を E2E（約 10 秒）。
+
+## 同日の test-auditor 対応（qa / run-summary 層）
+
+blocking 5 件: (1) 未再生でも warn 条件で failed が格下げされる → failed/warn を独立に集め重い方を採用、
+(2) 閾値が未拘束 → cpm 38.9/41.2・repeated 0.30/0.32・hallucination 0.49/0.51・定型句長 30/31 をリテラルで固定、
+(3) 中断（interrupted）経路 → rc=2・failed 集計・リネームなしを拘束、(4) 例外時に finished=true → 全 URL 完走時のみ true、
+(5) `warn_other_audio_apps` 無テスト → osascript モックで対照。non_blocking: ブラインド（総尺不明）で本文ありは warn、
+定型句長の上限を 20→30（「最後までご視聴いただきありがとうございました」22 字を拾う）、テストのログ先を
+`MOODLE_TRANSCRIBER_LOG_DIR` で分離、preflight の pgrep をリポジトリパスで絞る、`_norm`・watchdog 文言を固定。
+
+## page エンジンの test-auditor 対応（2026-10-24）
+
+blocking 4 件: (1) 1 本目がプレーヤー未到達（output=None）だと `_run_batch` が TypeError で落ち
+run-summary が書かれない → 出力先を args.output から先に決める。(2) 音声チャンクが止まった／届かない
+経路（唯一の脱出路）が未拘束 → _FakeSession に遅延供給モードを足し、チャンク 0 件でも video.ended で
+終了し failed になること、停止時に停滞で終了しハングしないことを固定。届いた音声秒数を entry に記録し
+動画長の半分未満なら warn。(3) `wait_for_player` がログイン後に別ページへ着地すると永久ループ、Ctrl+C も
+効かない → ログイン画面を一度見たら以後 login_timeout で諦める、`should_abort`（stop_event）で即脱出、
+外部 SSO（idp/saml/sso/auth）もログイン待ち扱い。Chrome なしの単体テストで固定。(4) video 要素なし経路が
+未拘束 → 「動画要素なし」で failed・再生/保存/離脱なしを固定。
+non_blocking: URL ごと flush、BrowserSession のスレッド境界（_call/start/close）、run() の page 分岐、
+PlaybackMonitor.total の保持、PageAudioCapture の冪等、E2E の assert 追加。
+本人の Chrome に AppleScript を流す旧検査 [4] は `MT_BLACKHOLE_CHECKS=1` のときだけ実行する。
+
+## 再監査（同日）への対応
+
+blocking 1 件: 偽セッションが全チャンクを先に投入していたため、主経路（セグメント到着ごとの poll）の
+停止処理を無効にしてもタイムアウト経路が救済してテストが緑のままだった。本番では動画終了後も
+ScriptProcessor が無音チャンクを出し続けるので救済は無く、動画末尾で無限ループになる回帰を見逃す。
+→ 偽セッションに「state() ごとに 1 秒進み 1 秒ぶんのチャンクを終了後も無音で供給し続ける」モードと
+state() 呼び出し上限（超えたら例外＝赤。ハングさせない）を追加し、[40] 1)/2) で「通常経路で 3 秒以内に止まる・
+poll はすべて segment 由来・qa.status=ok」を固定。隔離コピーで同変異が赤になることを確認。
+non_blocking 対応: `looks_like_login` をパス区切り／ホスト名ベースに（"sso"⊂lesson、"auth"⊂authors の
+過剰一致を解消、負例・正例をテストで固定）、キャプチャの `sr=` を検査して 16kHz 以外は failed、
+「届いた音声が動画長の半分未満」の status 格上げを拘束、wait_for_player の timeout 下限、
+Stub.pump の回数上限（永久ループを例外に）。SKILL.md の入力仕様を player.php に限定。

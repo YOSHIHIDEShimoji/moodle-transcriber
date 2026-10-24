@@ -1,8 +1,10 @@
 """自動テストスクリプト: import / フォーマット / デバイス / AppleScript / Whisper"""
 
 import shutil
+from pathlib import Path
 import subprocess
 import sys
+import time
 
 import numpy as np
 
@@ -70,11 +72,16 @@ def test_devices_and_tools() -> None:
 # ─── 4. AppleScript / Chrome 連携 ────────────────────────────────────────────
 
 def test_applescript() -> None:
-    import platform
-    print("\n[4] AppleScript / Chrome")
+    import os, platform
+    print("\n[4] AppleScript / Chrome（blackhole エンジン用・本人の Chrome を読む）")
 
     if platform.system() != "Darwin":
         check("AppleScript (macOS専用)", True, "スキップ (非macOS)")
+        return
+    # 既定の page エンジンは本人の Chrome を使わない。この検査は本人の Chrome に
+    # JS を流すので、従来方式を検証したいときだけ MT_BLACKHOLE_CHECKS=1 で有効にする。
+    if os.environ.get("MT_BLACKHOLE_CHECKS") != "1":
+        check("AppleScript / Chrome 検査", True, "スキップ (MT_BLACKHOLE_CHECKS=1 で有効・本人の Chrome を触らない)")
         return
 
     # Chrome が起動しているか
@@ -1409,11 +1416,13 @@ def test_callers_skip_save_exit_when_not_played() -> None:
              patch("main._prompt_rename", side_effect=lambda p: p), \
              patch("main.OutputWriter"), patch("main._print_progress"):
             args.output = d
-            _process_one_url(url, 0, 1, tr, args, 0, "BlackHole 2ch", {"keep_alive": None, "capture": None},
-                             threading.Event())
-        return saves, exits, triggers, ka, cap
+            entry = _process_one_url(url, 0, 1, tr, args, 0, "BlackHole 2ch", {"keep_alive": None, "capture": None},
+                                     threading.Event())
+        return saves, exits, triggers, ka, cap, entry
 
-    saves, exits, triggers, ka, cap = run_process((0.0, 262.0), False, 0)
+    saves, exits, triggers, ka, cap, entry = run_process((0.0, 262.0), False, 0)
+    check("_process_one_url 未再生: entry.qa.status == failed（monitor.played が QA に渡る）",
+          entry["qa"]["status"] == "failed" and entry["played"] is False, f"qa={entry['qa']['status']}")
     check("_process_one_url 未再生: 保存クリック 0 回", len(saves) == 0, f"saves={len(saves)}")
     check("_process_one_url 未再生: 離脱クリック 0 回", len(exits) == 0, f"exits={len(exits)}")
     check("_process_one_url 未再生: 再生リトライが打たれた（初回 + 再試行）",
@@ -1421,7 +1430,7 @@ def test_callers_skip_save_exit_when_not_played() -> None:
     check("_process_one_url 未再生: keep_alive.mark_ended/stop は呼ばれる", ka.mark_ended.called and ka.stop.called)
     check("_process_one_url 未再生: capture.stop は呼ばれる", cap.stop.called)
 
-    saves, exits, _, _, _ = run_process((3600.0, 3600.0), True, 100)
+    saves, exits, _, _, _, entry_ok = run_process((3600.0, 3600.0), True, 100)
     check("_process_one_url 再生済み(対照): 保存 1 回・離脱 1 回", len(saves) == 1 and len(exits) == 1,
           f"saves={len(saves)} exits={len(exits)}")
 
@@ -1468,27 +1477,33 @@ def test_callers_skip_save_exit_when_not_played() -> None:
         cap = MagicMock(); cap.segments.return_value = iter(segs)
         saves: list = []; exits: list = []; ka = MagicMock()
         sd_mod = MagicMock(); sd_mod.query_devices.return_value = {"name": "BlackHole 2ch"}
-        with tempfile.TemporaryDirectory() as d:
-            args = build_parser().parse_args(["--moodle-url", "example.com", "--no-auto-routing",
-                                              "--output", d, "--model", "tiny"])
-            with patch.dict(sys.modules, {"sounddevice": sd_mod}), \
-                 patch("main.find_loopback_device", return_value=0), \
-                 patch("main.get_tab_id_by_pattern", return_value=42), \
-                 patch("main.get_tab_url", return_value=url), \
-                 patch("main.get_moodle_page_info", return_value=("講義", url)), \
-                 patch("main.create_capture", return_value=cap), \
-                 patch("main.WindowKeepAlive", return_value=ka), \
-                 patch("main._trigger_with_retry"), \
-                 patch("main.get_viewing_percentage", return_value=pct), \
-                 patch("main.get_video_ended", return_value=ended), \
-                 patch("main.get_video_time", return_value=video_time), \
-                 patch("main.click_save_button", side_effect=lambda *a, **kw: saves.append(1)), \
-                 patch("main.click_exit_activity_button", side_effect=lambda *a, **kw: exits.append(1)), \
-                 patch("main._prompt_rename", side_effect=lambda p: p), \
-                 patch("main.OutputWriter"), patch("main._print_progress"), \
-                 patch("main.time.sleep"), patch("main.signal.signal"), \
-                 patch("transcriber.Transcriber", return_value=MagicMock(transcribe=MagicMock(return_value=[]))):
-                rc = run(args)
+        from contextlib import ExitStack
+        patches = [
+            lambda: patch.dict(sys.modules, {"sounddevice": sd_mod}),
+            lambda: patch("main.warn_other_audio_apps", return_value=[]),
+            lambda: patch("main.find_loopback_device", return_value=0),
+            lambda: patch("main.get_tab_id_by_pattern", return_value=42),
+            lambda: patch("main.get_tab_url", return_value=url),
+            lambda: patch("main.get_moodle_page_info", return_value=("講義", url)),
+            lambda: patch("main.create_capture", return_value=cap),
+            lambda: patch("main.WindowKeepAlive", return_value=ka),
+            lambda: patch("main._trigger_with_retry"),
+            lambda: patch("main.get_viewing_percentage", return_value=pct),
+            lambda: patch("main.get_video_ended", return_value=ended),
+            lambda: patch("main.get_video_time", return_value=video_time),
+            lambda: patch("main.click_save_button", side_effect=lambda *a, **kw: saves.append(1)),
+            lambda: patch("main.click_exit_activity_button", side_effect=lambda *a, **kw: exits.append(1)),
+            lambda: patch("main._prompt_rename", side_effect=lambda p: p),
+            lambda: patch("main.OutputWriter"), lambda: patch("main._print_progress"),
+            lambda: patch("main.time.sleep"), lambda: patch("main.signal.signal"),
+            lambda: patch("transcriber.Transcriber", return_value=MagicMock(transcribe=MagicMock(return_value=[]))),
+        ]
+        with tempfile.TemporaryDirectory() as d, ExitStack() as stack:
+            args = build_parser().parse_args(["--engine", "blackhole", "--moodle-url", "example.com",
+                                              "--no-auto-routing", "--output", d, "--model", "tiny"])
+            for mk in patches:
+                stack.enter_context(mk())
+            rc = run(args)
         return rc, saves, exits, ka
 
     rc, saves, exits, ka = run_single((0.0, 262.0), False, 0)
@@ -1498,6 +1513,959 @@ def test_callers_skip_save_exit_when_not_played() -> None:
     rc, saves, exits, _ = run_single((3600.0, 3600.0), True, 100)
     check("run() 再生済み(対照): 保存/離脱 1 回ずつ", len(saves) == 1 and len(exits) == 1,
           f"saves={len(saves)} exits={len(exits)}")
+
+
+def test_qa_metrics() -> None:
+    """#23: 自己診断（qa_metrics）の判定。既往の 3 障害が failed/warn として検出されること。"""
+    print("\n[32] qa_metrics 自己診断")
+    from qa import qa_metrics, MIN_CHARS_PER_MIN
+
+    good = [f"これは{i}番目の講義内容の説明です。詳しく話します。" for i in range(60)]
+    q = qa_metrics(good, 262.0, played=True, stop_reason="video.ended")
+    check("正常: status=ok", q["status"] == "ok", f"{q['status']} {q['warnings']}")
+    check("正常: 行数・字/分が入る", q["lines"] == 60 and q["chars_per_min"] > MIN_CHARS_PER_MIN)
+
+    q = qa_metrics(["ご視聴ありがとうございました"], 262.0, played=True, stop_reason="再生停止（currentTime 停滞）")
+    check("幻覚 1 行のみ → failed（逆相ステレオ事故の形）", q["status"] == "failed", f"{q['warnings']}")
+
+    q = qa_metrics([], 262.0, played=False, stop_reason="再生を開始できないため中止")
+    check("未再生・空 → failed（クリック事故の形）", q["status"] == "failed")
+    check("未再生の警告文がある", any("再生されなかった" in w for w in q["warnings"]))
+
+    q = qa_metrics(["短い"] * 3, 1800.0, played=True)
+    check("30 分で数行 → warn（少なすぎる）", q["status"] == "warn" and any("少なすぎる" in w for w in q["warnings"]))
+
+    rep = ["同じ文が連発しています。幻覚かもしれません。"] * 20 + good[:10]
+    q = qa_metrics(rep, 262.0, played=True)
+    check("同一文の連発 → warn", q["status"] == "warn" and any("連発" in w for w in q["warnings"]), f"{q['warnings']}")
+
+    q = qa_metrics(good, 262.0, played=True, stop_reason="音声が検出できないため中止")
+    check("内容は十分でも中止理由なら warn", q["status"] == "warn")
+
+    q = qa_metrics(good, 0.0, played=True)
+    check("総尺不明でも落ちない（字/分 0・ok）", q["status"] == "ok" and q["chars_per_min"] == 0)
+
+
+def test_run_batch_summary() -> None:
+    """#24: _run_batch が run-summary.json を書き、failed があれば rc=2、全 URL 分のエントリを持つ。"""
+    print("\n[33] _run_batch の run-summary.json と終了コード")
+    import argparse, json, tempfile
+    from unittest.mock import MagicMock, patch
+    from pathlib import Path
+    from main import _run_batch
+
+    urls = ["https://m.example.com/x?a=1", "https://m.example.com/x?a=2", "https://m.example.com/x?a=3"]
+
+    def make_runner(outdir, statuses):
+        def _one(url, i, total, tr, args, di, dn, current, stop_event):
+            st = statuses[i]
+            return {"index": i, "url": url, "page_url": url, "title": f"講義{i}",
+                    "output": str(Path(outdir) / f"講義{i}.txt"), "stop_reason": "video.ended",
+                    "played": st != "failed", "elapsed_seconds": 1.0,
+                    "qa": {"status": st, "lines": 10, "chars": 300, "video_seconds": 60.0,
+                           "chars_per_min": 300.0, "repeated_ratio": 0.0, "hallucination_ratio": 0.0,
+                           "warnings": [] if st == "ok" else ["x"]}}
+        return _one
+
+    with tempfile.TemporaryDirectory() as d:
+        args = argparse.Namespace(model="tiny", language="ja", cpu_threads=4, restore_to=None, json_summary=None, output=d)
+        with patch("main._process_one_url", side_effect=make_runner(d, ["ok", "ok", "ok"])), \
+             patch("main.time.sleep"), patch("main.signal.signal"), \
+             patch("transcriber.Transcriber", return_value=MagicMock()), \
+             patch("subprocess.run"):
+            rc = _run_batch(urls, args, 0, "BlackHole", False)
+        summary = Path(d) / "run-summary.json"
+        check("全 ok → rc=0", rc == 0, f"rc={rc}")
+        check("run-summary.json が出力ディレクトリに書かれる", summary.exists())
+        doc = json.loads(summary.read_text())
+        check("エントリ数 = URL 数（取りこぼしなし）", doc["total"] == 3 and [e["url"] for e in doc["entries"]] == urls)
+        check("finished=true", doc["finished"] is True)
+
+    with tempfile.TemporaryDirectory() as d:
+        args = argparse.Namespace(model="tiny", language="ja", cpu_threads=4, restore_to=None,
+                                  json_summary=str(Path(d) / "custom.json"))
+        with patch("main._process_one_url", side_effect=make_runner(d, ["ok", "failed", "warn"])), \
+             patch("main.time.sleep"), patch("main.signal.signal"), \
+             patch("transcriber.Transcriber", return_value=MagicMock()):
+            rc = _run_batch(urls, args, 0, "BlackHole", False)
+        doc = json.loads((Path(d) / "custom.json").read_text())
+        check("failed があれば rc=2", rc == 2, f"rc={rc}")
+        check("--json-summary の指定先に書かれる・集計が合う", doc["ok"] == 1 and doc["warn"] == 1 and doc["failed"] == 1)
+
+    # URL の途中で中断（stop_event）→ 残りは未処理として rc=2・finished=false
+    with tempfile.TemporaryDirectory() as d:
+        args = argparse.Namespace(model="tiny", language="ja", cpu_threads=4, restore_to=None, json_summary=None, output=d)
+        runner = make_runner(d, ["ok", "ok", "ok"])
+        def interrupting(url, i, total, tr, args_, di, dn, current, stop_event):
+            e = runner(url, i, total, tr, args_, di, dn, current, stop_event)
+            if i == 0:
+                stop_event.set()
+            return e
+        with patch("main._process_one_url", side_effect=interrupting), \
+             patch("main.time.sleep"), patch("main.signal.signal"), \
+             patch("transcriber.Transcriber", return_value=MagicMock()):
+            rc = _run_batch(urls, args, 0, "BlackHole", False)
+        doc = json.loads((Path(d) / "run-summary.json").read_text())
+        check("中断時: 処理済み 1 件だけ記録・finished=false・rc=2",
+              doc["total"] == 1 and doc["finished"] is False and rc == 2, f"total={doc['total']} rc={rc}")
+
+
+def test_process_one_url_returns_entry() -> None:
+    """#25: _process_one_url が QA 付きのエントリを返し、本文の行数を数えている。"""
+    print("\n[34] _process_one_url の戻り値（run-summary エントリ）")
+    import argparse, threading, tempfile
+    from unittest.mock import MagicMock, patch
+    from main import _process_one_url
+    from transcriber import TranscriptSegment
+
+    url = "https://example.com/mod/scorm/player.php?id=42"
+    seg = MagicMock(); seg.segment_id = 0; seg.data = np.ones(16000, dtype=np.float32) * 0.1; seg.start_time = 0.0
+    cap = MagicMock(); cap.segments.return_value = iter([seg])
+    tr = MagicMock()
+    tr.transcribe.return_value = [TranscriptSegment(text=f"本文{i}です。", start=i, end=i + 1, segment_id=0) for i in range(5)]
+    args = argparse.Namespace(keep_active="chrome", verbose=False, timestamps=False, format="txt",
+                              output=None, model="tiny", language="ja", segment_duration=30.0,
+                              overlap=5.0, keep_interval=20.0, save_interval=60.0)
+    with tempfile.TemporaryDirectory() as d, \
+         patch("main.navigate_to_url"), patch("main.time.sleep"), \
+         patch("main.get_active_tab_id", return_value=42), \
+         patch("main.wait_for_page_ready", return_value=url), \
+         patch("main.get_moodle_page_info", return_value=("講義X", url)), \
+         patch("main.create_capture", return_value=cap), \
+         patch("main.WindowKeepAlive", return_value=MagicMock()), \
+         patch("main._trigger_with_retry"), \
+         patch("main.get_viewing_percentage", return_value=100), \
+         patch("main.get_video_ended", return_value=True), \
+         patch("main.get_video_time", return_value=(60.0, 60.0)), \
+         patch("main.click_save_button"), patch("main.click_exit_activity_button"), \
+         patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main.OutputWriter"), patch("main._print_progress"):
+        args.output = d
+        entry = _process_one_url(url, 0, 1, tr, args, 0, "BlackHole 2ch",
+                                 {"keep_alive": None, "capture": None}, threading.Event())
+    check("エントリに url/title/output/qa がある", all(k in entry for k in ("url", "title", "output", "qa", "played")))
+    check("本文 5 行を数えている", entry["qa"]["lines"] == 5, f"lines={entry['qa']['lines']}")
+    check("stop_reason=video.ended・played=True", entry["stop_reason"] == "video.ended" and entry["played"] is True)
+    check("総尺 60 秒が QA の分母に入る", entry["qa"]["video_seconds"] == 60.0)
+
+
+def test_qa_boundaries() -> None:
+    """#26: qa_metrics の閾値を両側から固定し、failed が格下げされないことを拘束する。"""
+    print("\n[35] qa_metrics 境界値 / failed 不格下げ")
+    from qa import qa_metrics
+
+    def distinct(n, length=40):
+        return [("講義内容の説明文" + f"{i:04d}" + "あ" * 200)[:length] for i in range(n)]
+
+    # failed は warn 条件で格下げされない
+    q = qa_metrics(["はい", "えーと", "そうですね"], 262.0, played=False, stop_reason="再生を開始できないため中止")
+    check("未再生 + 数行 → failed（warn に格下げしない）", q["status"] == "failed", f"{q['status']} {q['warnings']}")
+    q = qa_metrics(distinct(40), 1800.0, played=False)
+    check("未再生 + 十分な本文 → failed", q["status"] == "failed")
+    q = qa_metrics([], 262.0, played=True)
+    check("再生済み + 空 → failed", q["status"] == "failed")
+    check("未再生の警告文", "再生されなかった" in " ".join(qa_metrics(["はい"], 262.0, False)["warnings"]))
+
+    # ブラインド（総尺不明・未再生）だが本文あり → warn
+    q = qa_metrics(distinct(40), -1.0, played=False)
+    check("ブラインド + 本文あり → warn（ブラインドモード）", q["status"] == "warn" and any("ブラインド" in w for w in q["warnings"]),
+          f"{q['status']} {q['warnings']}")
+
+    # cpm 境界 (262 秒 = 4.367 分): 170 字 → 38.9 → warn / 180 字 → 41.2 → ok
+    check("cpm 38.9 → warn", qa_metrics(["あ" * 170], 262.0, True)["status"] == "warn")
+    check("cpm 41.2 → ok", qa_metrics(["あ" * 180], 262.0, True)["status"] == "ok")
+
+    # repeated 境界: 100 行中 重複行 30 (0.30) → ok / 32 (0.32) → warn
+    good = distinct(100)
+    q30 = qa_metrics(good[:71] + [good[0]] * 29, 262.0, True)
+    q32 = qa_metrics(good[:69] + [good[0]] * 31, 262.0, True)
+    check("repeated 0.30 → ok", q30["repeated_ratio"] == 0.3 and q30["status"] == "ok", f"{q30['repeated_ratio']} {q30['status']}")
+    check("repeated 0.32 → warn", q32["repeated_ratio"] == 0.32 and q32["status"] == "warn", f"{q32['repeated_ratio']} {q32['status']}")
+
+    # hallucination 境界: 0.49 → 非 failed / 0.51 → failed
+    q49 = qa_metrics(["ご視聴ありがとうございました"] * 49 + good[:51], 262.0, True)
+    q51 = qa_metrics(["ご視聴ありがとうございました"] * 51 + good[:49], 262.0, True)
+    check("hallucination 0.49 → failed ではない", q49["hallucination_ratio"] == 0.49 and q49["status"] != "failed")
+    check("hallucination 0.51 → failed", q51["hallucination_ratio"] == 0.51 and q51["status"] == "failed")
+
+    # 定型句を数える最大長 30/31
+    s30 = "ご視聴ありがとうございました" + "あ" * 16
+    s31 = s30 + "あ"
+    check("30 字の定型句行は幻覚として数える", qa_metrics([s30], 262.0, True)["hallucination_ratio"] == 1.0)
+    check("31 字は数えない", qa_metrics([s31], 262.0, True)["hallucination_ratio"] == 0.0)
+    check("「最後までご視聴いただきありがとうございました」1 行 → failed",
+          qa_metrics(["最後までご視聴いただきありがとうございました"], 262.0, True)["status"] == "failed")
+
+    # 正規化: 句読点違いは同一文
+    q = qa_metrics(["同じ文章です。", "同じ文章です", "同じ文章です、"], 262.0, True)
+    check("句読点違いを重複と数える（_norm）", q["repeated_ratio"] == 1.0, f"{q['repeated_ratio']}")
+
+    # 異常終了理由（PlaybackMonitor の実文字列）
+    for reason in ("録音時間が総尺を大幅超過（watchdog）", "再生を開始できないため中止", "音声が検出できないため中止"):
+        q = qa_metrics(distinct(60), 262.0, True, stop_reason=reason)
+        check(f"良好本文でも理由『{reason}』→ warn", q["status"] == "warn" and any("異常終了" in w for w in q["warnings"]))
+    q = qa_metrics(distinct(60), 262.0, True, stop_reason="video.ended")
+    check("video.ended は ok", q["status"] == "ok")
+
+
+def test_run_batch_interrupt_and_exception() -> None:
+    """#27: 中断（interrupted）と例外経路で run-summary.json / rc が正しい。"""
+    print("\n[36] _run_batch 中断・例外・warn のみ")
+    import argparse, json, tempfile
+    from unittest.mock import MagicMock, patch
+    from pathlib import Path
+    from main import _run_batch
+
+    urls = ["https://m.example.com/x?a=1", "https://m.example.com/x?a=2", "https://m.example.com/x?a=3"]
+
+    def entry(i, url, outdir, status):
+        return {"index": i, "url": url, "page_url": url, "title": f"講義{i}",
+                "output": str(Path(outdir) / f"講義{i}.txt"), "stop_reason": "video.ended",
+                "played": status in ("ok", "warn"), "elapsed_seconds": 1.0,
+                "qa": {"status": status, "lines": 10, "chars": 300, "video_seconds": 60.0,
+                       "chars_per_min": 300.0, "repeated_ratio": 0.0, "hallucination_ratio": 0.0,
+                       "warnings": [] if status == "ok" else ["x"]}}
+
+    base_args = dict(model="tiny", language="ja", cpu_threads=4, restore_to=None, json_summary=None, output=None)
+
+    # 3 本目で Ctrl+C → status interrupted → rc=2・failed=1・finished=false
+    with tempfile.TemporaryDirectory() as d:
+        def runner(url, i, total, tr, args, di, dn, current, stop_event):
+            if i == 2:
+                stop_event.set()
+                return entry(i, url, d, "interrupted")
+            return entry(i, url, d, "ok")
+        with patch("main._process_one_url", side_effect=runner), patch("main.time.sleep"), \
+             patch("main.signal.signal"), patch("transcriber.Transcriber", return_value=MagicMock()), \
+             patch("subprocess.run"):
+            rc = _run_batch(urls, argparse.Namespace(**{**base_args, "output": d}), 0, "BlackHole", False)
+        doc = json.loads((Path(d) / "run-summary.json").read_text())
+        check("interrupted → rc=2", rc == 2, f"rc={rc}")
+        check("interrupted は failed に集計", doc["failed"] == 1 and doc["ok"] == 2, f"{doc['ok']}/{doc['failed']}")
+        check("interrupted → finished=false", doc["finished"] is False)
+
+    # warn だけなら rc=0
+    with tempfile.TemporaryDirectory() as d:
+        statuses = ["ok", "warn", "ok"]
+        with patch("main._process_one_url", side_effect=lambda url, i, *a: entry(i, url, d, statuses[i])), \
+             patch("main.time.sleep"), patch("main.signal.signal"), \
+             patch("transcriber.Transcriber", return_value=MagicMock()), patch("subprocess.run"):
+            rc = _run_batch(urls, argparse.Namespace(**{**base_args, "output": d}), 0, "BlackHole", False)
+        check("warn のみ → rc=0", rc == 0, f"rc={rc}")
+
+    # 2 本目で例外 → URL ごとの flush により 1 本目は残り、finished=false
+    with tempfile.TemporaryDirectory() as d:
+        flushed_before_crash: list = []
+        def crashing(url, i, *a):
+            if i == 1:
+                p = Path(d) / "run-summary.json"
+                flushed_before_crash.append(p.exists() and json.loads(p.read_text())["total"] == 1)
+                raise RuntimeError("boom")
+            return entry(i, url, d, "ok")
+        raised = False
+        with patch("main._process_one_url", side_effect=crashing), patch("main.time.sleep"), \
+             patch("main.signal.signal"), patch("transcriber.Transcriber", return_value=MagicMock()), \
+             patch("subprocess.run"):
+            try:
+                _run_batch(urls, argparse.Namespace(**{**base_args, "output": d}), 0, "BlackHole", False)
+            except RuntimeError:
+                raised = True
+        summary = Path(d) / "run-summary.json"
+        check("例外は伝播する", raised)
+        check("例外が起きる前に 1 本目が flush されている（URL ごと flush）", flushed_before_crash == [True], f"{flushed_before_crash}")
+        check("例外前に処理した 1 本は run-summary に残る（URL ごと flush）", summary.exists() and json.loads(summary.read_text())["total"] == 1)
+        check("例外時は finished=false", json.loads(summary.read_text())["finished"] is False)
+
+
+def test_process_one_url_interrupt() -> None:
+    """#28: _process_one_url が途中で Ctrl+C（stop_event）されたら status=interrupted、リネーム問い合わせなし。"""
+    print("\n[37] _process_one_url の中断経路")
+    import argparse, threading, tempfile
+    from unittest.mock import MagicMock, patch
+    from main import _process_one_url
+
+    url = "https://example.com/mod/scorm/player.php?id=42"
+    segs = []
+    for i in range(6):
+        m = MagicMock(); m.segment_id = i; m.data = np.zeros(16000, dtype=np.float32); m.start_time = 30.0 * i
+        segs.append(m)
+    cap = MagicMock(); cap.segments.return_value = iter(segs)
+    tr = MagicMock(); tr.transcribe.return_value = []
+    ev = threading.Event()
+    renames: list = []
+    times = iter([(30.0, 600.0), (60.0, 600.0)])
+    def video_time(*a, **kw):
+        t = next(times, (90.0, 600.0))
+        if t[0] >= 60.0:
+            ev.set()
+        return t
+    args = argparse.Namespace(keep_active="chrome", verbose=False, timestamps=False, format="txt",
+                              output=None, model="tiny", language="ja", segment_duration=30.0,
+                              overlap=5.0, keep_interval=20.0, save_interval=60.0)
+    with tempfile.TemporaryDirectory() as d, \
+         patch("main.navigate_to_url"), patch("main.time.sleep"), \
+         patch("main.get_active_tab_id", return_value=42), \
+         patch("main.wait_for_page_ready", return_value=url), \
+         patch("main.get_moodle_page_info", return_value=("講義", url)), \
+         patch("main.create_capture", return_value=cap), \
+         patch("main.WindowKeepAlive", return_value=MagicMock()), \
+         patch("main._trigger_with_retry"), \
+         patch("main.get_viewing_percentage", return_value=10), \
+         patch("main.get_video_ended", return_value=False), \
+         patch("main.get_video_time", side_effect=video_time), \
+         patch("main.click_save_button"), patch("main.click_exit_activity_button"), \
+         patch("main._prompt_rename", side_effect=lambda p: renames.append(p) or p), \
+         patch("main.OutputWriter"), patch("main._print_progress"):
+        args.output = d
+        entry = _process_one_url(url, 0, 1, tr, args, 0, "BlackHole 2ch", {"keep_alive": None, "capture": None}, ev)
+    check("中断 → status=interrupted", entry["qa"]["status"] == "interrupted", f"{entry['qa']['status']}")
+    check("中断の警告文がある", any("Ctrl+C" in w for w in entry["qa"]["warnings"]))
+    check("中断時はリネーム問い合わせをしない", len(renames) == 0, f"renames={len(renames)}")
+
+
+def test_warn_other_audio_apps() -> None:
+    """#29: 他アプリの再生検知（preflight の合格ゲートに使う）。"""
+    print("\n[38] warn_other_audio_apps")
+    from unittest.mock import MagicMock, patch
+    import platform_utils
+    from platform_utils import warn_other_audio_apps
+
+    def osa(stdout, rc=0):
+        m = MagicMock(); m.returncode = rc; m.stdout = stdout; return m
+
+    scripts: list = []
+    def fake(script, timeout=10.0):
+        scripts.append(script)
+        return osa("playing\n") if '"Spotify"' in script else osa("not running\n")
+    with patch("platform_utils.SYSTEM", "Darwin"), patch("platform_utils._osascript", side_effect=fake):
+        r = warn_other_audio_apps()
+    check("Spotify playing → ['Spotify']", r == ["Spotify"], f"{r}")
+    check("スクリプトに player state を問い合わせる", all("player state" in s for s in scripts))
+    check("Spotify と Music の両方を問い合わせる", len(scripts) == 2 and any('"Music"' in s for s in scripts), f"{len(scripts)}")
+    for out in ("paused\n", "stopped\n", "not running\n"):
+        with patch("platform_utils.SYSTEM", "Darwin"), patch("platform_utils._osascript", return_value=osa(out)):
+            check(f"{out.strip()!r} → []", warn_other_audio_apps() == [])
+    with patch("platform_utils.SYSTEM", "Darwin"), patch("platform_utils._osascript", return_value=osa("", rc=1)):
+        check("rc≠0 → []", warn_other_audio_apps() == [])
+    with patch("platform_utils.SYSTEM", "Darwin"), patch("platform_utils._osascript", return_value=None):
+        check("タイムアウト(None) → []", warn_other_audio_apps() == [])
+    calls: list = []
+    with patch("platform_utils.SYSTEM", "Linux"), patch("platform_utils._osascript", side_effect=lambda *a, **k: calls.append(1)):
+        check("非 macOS は osascript を呼ばず []", warn_other_audio_apps() == [] and not calls)
+
+    # tab_text の埋め込み JS は AppleScript 制約（" と \ 禁止）を満たす
+    import tab_text
+    check("tab_text._TEXT_JS に \" と \\\\ が無い", '"' not in tab_text._TEXT_JS and "\\" not in tab_text._TEXT_JS)
+
+
+def test_page_capture() -> None:
+    """#30: PageAudioCapture のセグメント化・位相・終端・タイムアウト。"""
+    print("\n[39] PageAudioCapture（ページ内キャプチャの受け口）")
+    import base64
+    from page_capture import PageAudioCapture, SAMPLE_RATE
+
+    rms = lambda a: float(np.sqrt(np.mean(np.square(a))))
+    cap = PageAudioCapture(segment_duration=2.0, overlap_duration=0.5)
+    t = np.arange(SAMPLE_RATE) / SAMPLE_RATE
+    tone = (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)   # 1 秒
+    cap.start()
+    # 逆相ステレオを base64(int16 LRLR) で 5 秒ぶん投入
+    st = np.stack([tone, -tone], axis=1)
+    b64 = base64.b64encode((st * 32767).astype(np.int16).tobytes()).decode()
+    for _ in range(5):
+        cap.feed_b64(b64)
+    segs = []
+    while True:
+        s = cap.next_segment(timeout=0.1)
+        if s is None:
+            break
+        segs.append(s)
+    check("5 秒入力・2 秒セグメント・0.5 秒重複 → 3 本（0, 1.5, 3.0 秒開始）",
+          [round(s.start_time, 1) for s in segs] == [0.0, 1.5, 3.0], f"{[round(s.start_time,1) for s in segs]}")
+    check("セグメント長は 2 秒", all(len(s.data) == 2 * SAMPLE_RATE for s in segs))
+    check("逆相ステレオでも打ち消されない（downmix 共有）", all(rms(s.data) > 0.15 for s in segs), f"{[round(rms(s.data),3) for s in segs]}")
+    check("segment_id は連番", [s.segment_id for s in segs] == [0, 1, 2])
+    check("seconds_received = 5.0", abs(cap.seconds_received - 5.0) < 1e-6)
+    check("タイムアウト時は None（終端ではない）", cap.next_segment(timeout=0.05) is None)
+    cap.stop()
+    tail = cap.next_segment(timeout=0.5)
+    check("stop() で残り（4.5〜5.0 秒の 0.5 秒）は 1 秒未満なので捨て、終端 None", tail is None)
+    check("終端後も None を返し続ける", cap.next_segment(timeout=0.05) is None)
+    qsize_before = cap._queue.qsize()
+    cap.stop()
+    check("stop() は冪等（2 回目で終端やセグメントを追加しない）", cap._queue.qsize() == qsize_before)
+    got = cap.seconds_received
+    cap.feed_pcm(st)
+    check("stop() 後の入力は無視", cap.seconds_received == got)
+
+    # 残りが 1 秒以上なら最終セグメントとして流す
+    cap2 = PageAudioCapture(segment_duration=2.0, overlap_duration=0.5); cap2.start()
+    for _ in range(3):
+        cap2.feed_pcm(st)            # 3 秒 → 1 本出て残り 1.5 秒（重複 0.5 含む）
+    first = cap2.next_segment(timeout=0.1)
+    cap2.stop()
+    last = cap2.next_segment(timeout=0.5)
+    check("stop(): 残り 1.0 秒（重複除く）を最終セグメントとして出す",
+          first is not None and last is not None and abs(len(last.data) / SAMPLE_RATE - 1.0) < 1e-6 and abs(last.start_time - 2.0) < 1e-6,
+          f"last={None if last is None else (len(last.data)/SAMPLE_RATE, last.start_time)}")
+
+    # start 前・stop 後の入力は無視
+    cap3 = PageAudioCapture(1.0, 0.0)
+    cap3.feed_pcm(st)
+    check("start() 前の入力は無視", cap3.seconds_received == 0.0)
+    # 1ch 入力も受ける
+    cap4 = PageAudioCapture(1.0, 0.0); cap4.start(); cap4.feed_pcm(tone)
+    check("モノラル入力も受ける", cap4.next_segment(timeout=0.1) is not None)
+
+
+class _FakeSession:
+    """BrowserSession の代替。再生状態と音声チャンクの流れをテストから制御する。
+
+    feed_seconds: start_capture 時に一括投入する秒数（従来モード）
+    lazy_chunks:  state() が呼ばれるたびに 1 秒ぶん投入する上限（タイムアウト経路の再現用）。
+                  None なら無効。0 なら 1 チャンクも届かない。
+    """
+
+    def __init__(self, play_ok=True, player_url="https://m.example.com/mod/scorm/player.php?a=1",
+                 duration=60.0, stop_event=None, interrupt_after=None, feed_seconds=0.0,
+                 has_video=True, capture_result="capturing sr=16000 state=running", lazy_chunks=None,
+                 continuous=False, max_state_calls=400):
+        """continuous=True: 本番の ScriptProcessor と同じく、state() が呼ばれるたびに 1 秒ぶんの
+        チャンクを**動画終了後も無音で**供給し続ける（タイムアウト経路が救済できない条件）。
+        max_state_calls: 止まらない回帰をハングでなく例外（赤）にする上限。"""
+        import base64
+        self._continuous = continuous
+        self._max_state_calls = max_state_calls
+        self.play_ok = play_ok
+        self.player_url = player_url
+        self.duration = duration
+        self.calls: list[str] = []
+        self.sink = None
+        self.cur = 0.0
+        self.playing = False
+        self.state_calls = 0
+        self._stop_event = stop_event
+        self._interrupt_after = interrupt_after
+        self._feed_seconds = feed_seconds
+        self._has_video = has_video
+        self._capture_result = capture_result
+        self._lazy_left = lazy_chunks
+        self.wait_args: dict = {}
+        sr = 16000
+        t = np.arange(sr) / sr
+        tone = (0.2 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        self._b64_tone = base64.b64encode((np.stack([tone, tone], axis=1) * 32767).astype(np.int16).tobytes()).decode()
+        self._b64_silence = base64.b64encode(np.zeros(sr * 2, dtype=np.int16).tobytes()).decode()
+
+    def set_chunk_sink(self, sink): self.sink = sink
+    def goto(self, url): self.calls.append("goto"); return url
+    def url(self): return self.player_url or "https://m.example.com/login/index.php"
+    def title(self): return "講義X | コース | Moodle"
+    def pump(self, ms=200): pass
+    def has_video(self): return self._has_video
+    def wait_for_player(self, contains="player.php", timeout=60.0, login_timeout=600.0,
+                        on_login_required=None, should_abort=None, poll_ms=500):
+        self.wait_args = {"contains": contains, "timeout": timeout, "login_timeout": login_timeout,
+                          "has_abort": should_abort is not None}
+        if self.player_url is None:
+            if on_login_required: on_login_required("https://m.example.com/login/index.php")
+            return None
+        return self.player_url
+    def start_capture(self):
+        self.calls.append("start_capture")
+        if self._capture_result != "no_video" and self.sink is not None:
+            for _ in range(int(self._feed_seconds)):
+                self.sink(self._b64_tone if self.play_ok else self._b64_silence)
+        return self._capture_result
+    def stop_capture(self): self.calls.append("stop_capture"); return "stopped"
+    def play(self):
+        self.calls.append("play")
+        if self.play_ok:
+            self.playing = True
+            return "playing"
+        return "ERR NotAllowedError"
+    def state(self):
+        from browser import VideoState
+        self.state_calls += 1
+        if self.state_calls > self._max_state_calls:
+            raise RuntimeError("fake session: state() call limit — 終了処理が走っていない")
+        if self._interrupt_after is not None and self.state_calls >= self._interrupt_after and self._stop_event:
+            self._stop_event.set()
+        if self._lazy_left is not None and self._lazy_left > 0 and self.sink is not None:
+            self._lazy_left -= 1
+            self.sink(self._b64_tone if self.play_ok else self._b64_silence)
+        if self.playing:
+            # continuous モードは「state() 1 回 = 1 秒進む = 1 秒ぶんのチャンク」で実時間比 1:1
+            self.cur = min(self.duration, self.cur + (1.0 if self._continuous else 10.0))
+        ended = self.playing and self.cur >= self.duration
+        if self._continuous and self.sink is not None:
+            # 再生中はトーン、未再生・終了後は無音。チャンクは枯れない
+            self.sink(self._b64_tone if (self.playing and not ended) else self._b64_silence)
+        return VideoState(found=True, paused=not self.playing or ended, ended=ended,
+                          current_time=self.cur, duration=self.duration, capture_count=1, ctx_state="running")
+    def viewing_percentage(self): return int(self.cur / self.duration * 100) if self.playing else 0
+    def click_save(self): self.calls.append("save"); return True
+    def click_exit(self): self.calls.append("exit"); return True
+
+
+def test_process_one_url_page() -> None:
+    """#31: page エンジンの 1 URL 処理（偽セッション）。再生済み/未再生/ログイン失敗/中断。"""
+    print("\n[40] _process_one_url_page（page エンジン）")
+    import argparse, threading, tempfile
+    from unittest.mock import MagicMock, patch
+    from main import _process_one_url_page, PlaybackMonitor
+    from transcriber import TranscriptSegment
+
+    def mk_args(d, seg=1.0, ov=0.0):
+        return argparse.Namespace(verbose=False, timestamps=False, format="txt", output=d, model="tiny",
+                                  language="ja", segment_duration=seg, overlap=ov, save_interval=0,
+                                  login_timeout=5.0, player_marker="player.php")
+    def mk_tr():
+        tr = MagicMock()
+        tr.transcribe.side_effect = lambda data, time_offset=0.0: [TranscriptSegment(text=f"本文 {time_offset:.0f} 秒の説明です。", start=time_offset, end=time_offset + 1, segment_id=0)]
+        return tr
+
+    # 1) 再生できる: 本文が出て、ended で止まり、保存→離脱を押す。
+    #    チャンクは終了後も無音で続く（本番同様）ので、通常経路の停止処理が無効なら
+    #    タイムアウト経路は救済できず、state() 上限で RuntimeError になる。
+    polls_main: list = []
+    orig_poll_m = PlaybackMonitor.poll
+    def rec_poll_m(self, silent=None, elapsed=None):
+        polls_main.append(silent); return orig_poll_m(self, silent=silent, elapsed=elapsed)
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"), patch.object(PlaybackMonitor, "poll", rec_poll_m):
+        sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=2, continuous=True)
+        t0 = time.monotonic()
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), mk_args(d), sess, threading.Event())
+        took = time.monotonic() - t0
+        out_exists = bool(entry["output"]) and Path(entry["output"]).exists()
+    check("再生済み: played=True・stop_reason=video.ended", entry["played"] is True and entry["stop_reason"] == "video.ended",
+          f"{entry['played']} {entry['stop_reason']}")
+    check("再生済み: 通常経路（セグメント到着ごとの poll）で止まる。タイムアウト経路は使わず 3 秒以内",
+          took < 3.0 and polls_main and all(s is False for s in polls_main), f"took={took:.1f}s polls={polls_main[:6]}")
+    check("再生済み: qa.status=ok", entry["qa"]["status"] == "ok", f"{entry['qa']}")
+    check("再生済み: 本文が数えられる（qa.lines>0）", entry["qa"]["lines"] > 0, f"lines={entry['qa']['lines']}")
+    check("再生済み: タイトルは | の前", entry["title"] == "講義X")
+    check("再生済み: 保存→離脱を押す", sess.calls[-2:] == ["save", "exit"], f"{sess.calls[-4:]}")
+    check("再生済み: stop_capture を呼ぶ", "stop_capture" in sess.calls)
+    check("再生済み: 出力ファイルが書かれる", out_exists)
+    check("再生済み: qa.video_seconds=60", entry["qa"]["video_seconds"] == 60.0)
+
+    # 2) 再生できない: 無音が流れ続け、未開始 → 再試行 → 中止。保存/離脱は押さない
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=False, duration=60.0, feed_seconds=2, continuous=True)
+        t0 = time.monotonic()
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), mk_args(d), sess, threading.Event())
+        took = time.monotonic() - t0
+    check("未再生: played=False・中止で終了", entry["played"] is False and "中止" in entry["stop_reason"], f"{entry['stop_reason']}")
+    check("未再生: 通常経路で止まる（3 秒以内）", took < 3.0, f"took={took:.1f}s")
+    check("未再生: qa.status=failed", entry["qa"]["status"] == "failed", f"{entry['qa']['warnings']}")
+    check("未再生: 保存/離脱を押さない", "save" not in sess.calls and "exit" not in sess.calls, f"{sess.calls}")
+    check("未再生: 再生を複数回試みた（初回 5 回 + 再試行）", sess.calls.count("play") >= 5 + PlaybackMonitor.NOT_STARTED_MAX_RETRY,
+          f"plays={sess.calls.count('play')}")
+
+    # 3) ログイン待ちタイムアウト（プレーヤー未到達）→ failed、出力なし
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._print_progress"):
+        sess = _FakeSession(player_url=None)
+        entry = _process_one_url_page("https://m.example.com/mod/scorm/player.php?a=9", 0, 1, mk_tr(), mk_args(d), sess, threading.Event())
+    check("プレーヤー未到達: failed・output=None", entry["qa"]["status"] == "failed" and entry["output"] is None, f"{entry['qa']}")
+    check("プレーヤー未到達: 再生もキャプチャもしない", "play" not in sess.calls and "start_capture" not in sess.calls)
+
+    # 4) Ctrl+C（stop_event）→ interrupted、リネームなし
+    renames: list = []
+    ev = threading.Event()
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: renames.append(p) or p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=True, duration=600.0, feed_seconds=12, stop_event=ev, interrupt_after=8)
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), mk_args(d), sess, ev)
+    check("中断: status=interrupted", entry["qa"]["status"] == "interrupted", f"{entry['qa']['status']}")
+    check("中断: リネーム問い合わせなし・離脱を押さない", not renames and "exit" not in sess.calls)
+
+    # 5) 引数の配線: player_marker / login_timeout / 中断コールバックが wait_for_player に渡る
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=12)
+        a = mk_args(d); a.player_marker = "lesson.php"; a.login_timeout = 123.0
+        _process_one_url_page(sess.player_url, 0, 1, mk_tr(), a, sess, threading.Event())
+    check("wait_for_player に player_marker / login_timeout / 中断判定が渡る",
+          sess.wait_args == {"contains": "lesson.php", "timeout": 60.0, "login_timeout": 123.0, "has_abort": True}, f"{sess.wait_args}")
+
+    # 6) video 要素なし → 再生もキャプチャ継続もせず、動画要素なしで failed
+    import main as _main
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"), patch.object(_main, "PAGE_VIDEO_WAIT", 0.0):
+        sess = _FakeSession(has_video=False, capture_result="no_video")
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), sess and mk_args(d), sess, threading.Event())
+        out_exists = bool(entry["output"]) and Path(entry["output"]).exists()
+    check("no_video: stop_reason=動画要素なし・failed", entry["stop_reason"] == "動画要素なし" and entry["qa"]["status"] == "failed",
+          f"{entry['stop_reason']} {entry['qa']['status']}")
+    check("no_video: 再生・保存・離脱を試みない", not any(c in sess.calls for c in ("play", "save", "exit")), f"{sess.calls}")
+    check("no_video: 出力ファイルは閉じて残る（ヘッダのみ）", out_exists)
+
+    # 7) 音声チャンクが途中で止まる（動画は進んで終了）→ タイムアウト経路で poll(silent=True) → video.ended で終了
+    polls: list = []
+    orig_poll = PlaybackMonitor.poll
+    def rec_poll(self, silent=None, elapsed=None):
+        polls.append(silent); return orig_poll(self, silent=silent, elapsed=elapsed)
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"), patch.object(PlaybackMonitor, "poll", rec_poll):
+        sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=0, lazy_chunks=0)   # 1 チャンクも届かない
+        a = mk_args(d, seg=1.0); a.page_poll_timeout = 0.05
+        t0 = time.monotonic()
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), a, sess, threading.Event())
+        took = time.monotonic() - t0
+    check("チャンク 0 件: タイムアウト経路で poll(silent=True) が走る", polls and all(s is True for s in polls), f"polls={polls[:5]}")
+    check("チャンク 0 件: 動画終了を検出してループが終わる", entry["stop_reason"] == "video.ended" and took < 20, f"{entry['stop_reason']} took={took:.1f}s")
+    check("チャンク 0 件: 本文なし → failed（偽成功にならない）", entry["qa"]["status"] == "failed" and entry["qa"]["lines"] == 0)
+    check("チャンク 0 件: stop_capture / capture 終了処理が走る", "stop_capture" in sess.calls)
+    check("チャンク 0 件: audio_seconds_received=0 を記録", entry.get("audio_seconds_received") == 0.0, f"{entry.get('audio_seconds_received')}")
+
+    # 8) 途中でチャンクが止まり動画も進まない（再生停止）→ 停滞で終了、ハングしない
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=True, duration=600.0, feed_seconds=3, lazy_chunks=0)
+        a = mk_args(d, seg=1.0); a.page_poll_timeout = 0.05
+        # 3 秒ぶん届いた後は無音・停止: state() の進行を止める
+        orig_state = sess.state
+        def frozen_state():
+            st = orig_state(); sess.cur = 20.0; return st
+        sess.state = frozen_state
+        t0 = time.monotonic()
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), a, sess, threading.Event())
+        took = time.monotonic() - t0
+    check("チャンク停止 + 再生停止: 停滞 or 無音で終了しハングしない", entry["stop_reason"] != "" and took < 20,
+          f"{entry['stop_reason']} took={took:.1f}s")
+    check("チャンク停止: 届いた音声が動画長の半分未満 → 警告", any("半分未満" in w for w in entry["qa"]["warnings"]), f"{entry['qa']['warnings']}")
+
+    # 9) 字/分は十分（長文）だが届いた音声が半分未満 → ok ではなく warn に格上げ
+    def mk_tr_long():
+        tr = MagicMock()
+        tr.transcribe.side_effect = lambda data, time_offset=0.0: [TranscriptSegment(
+            text=("長い本文" + f"{time_offset:.0f}" + "あ" * 120), start=time_offset, end=time_offset + 1, segment_id=0)]
+        return tr
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=3, lazy_chunks=0)
+        a = mk_args(d, seg=1.0); a.page_poll_timeout = 0.05
+        orig_state = sess.state
+        def frozen_state():
+            st = orig_state(); sess.cur = 20.0; return st
+        sess.state = frozen_state
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr_long(), a, sess, threading.Event())
+    check("半分未満: 字/分が十分でも status は warn に格上げ", entry["qa"]["status"] == "warn" and entry["qa"]["chars_per_min"] >= 40,
+          f"{entry['qa']['status']} cpm={entry['qa']['chars_per_min']} {entry['qa']['warnings']}")
+
+    # 10) AudioContext が 16kHz を拒否 → 偽成功にせず failed
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=True, duration=60.0, capture_result="capturing sr=48000 state=running")
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), mk_args(d), sess, threading.Event())
+    check("サンプルレート不一致 → failed・再生しない", entry["qa"]["status"] == "failed" and "サンプルレート" in entry["stop_reason"]
+          and "play" not in sess.calls, f"{entry['stop_reason']} {sess.calls}")
+
+
+def test_page_engine_live() -> None:
+    """#32: 実 Chrome（専用プロファイル・ヘッドレス）でページ内キャプチャ → 文字起こしループを通す。
+
+    ローカル HTTP で配信した逆相ステレオのテスト動画（iframe 内）を使う。Moodle 不要・ユーザーの Chrome 不操作。
+    playwright / Chrome が無い環境、または MT_SKIP_BROWSER=1 ではスキップ。
+    """
+    print("\n[41] page エンジン実機 E2E（ヘッドレス Chrome・ローカル動画）")
+    import os, argparse, tempfile, threading, wave
+    from functools import partial
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+    from unittest.mock import MagicMock, patch
+    if os.environ.get("MT_SKIP_BROWSER") == "1":
+        check("page エンジン E2E", True, "スキップ (MT_SKIP_BROWSER=1)"); return
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        check("page エンジン E2E", True, "スキップ (playwright 未導入)"); return
+    if not Path("/Applications/Google Chrome.app").exists():
+        check("page エンジン E2E", True, "スキップ (Google Chrome 無し)"); return
+
+    from browser import BrowserSession
+    from main import _process_one_url_page
+    from transcriber import TranscriptSegment, audio_rms
+
+    with tempfile.TemporaryDirectory() as d:
+        fx = Path(d) / "fx"; fx.mkdir()
+        sr = 48000; t = np.arange(sr * 8) / sr
+        sig = 0.3 * np.sin(2 * np.pi * 440 * t)
+        st = np.stack([sig, -sig], axis=1)   # 逆相ステレオ（実機で観測した形）
+        with wave.open(str(fx / "tone.wav"), "wb") as w:
+            w.setnchannels(2); w.setsampwidth(2); w.setframerate(sr); w.writeframes((st * 32767).astype(np.int16).tobytes())
+        (fx / "player.html").write_text(
+            '<!doctype html><html><head><meta charset="utf-8"><title>テスト講義 | コース | TestMoodle</title></head>'
+            '<body><p>視聴状況 0%</p><div id="save"><input type="button" value="保存" onclick="window.__saved=(window.__saved||0)+1"></div>'
+            '<div id="region-main"><a href="#" onclick="window.__exited=true;return false;">活動から抜ける</a></div>'
+            '<iframe src="inner.html" width="640" height="300"></iframe></body></html>', encoding="utf-8")
+        (fx / "inner.html").write_text('<!doctype html><html><body><video src="tone.wav"></video></body></html>')
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), partial(SimpleHTTPRequestHandler, directory=str(fx)))
+        th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
+        port = srv.server_address[1]
+        url = f"http://127.0.0.1:{port}/player.html"
+
+        rms_seen: list[float] = []
+        tr = MagicMock()
+        def fake_transcribe(data, time_offset=0.0):
+            rms_seen.append(audio_rms(data))
+            return [TranscriptSegment(text=f"テスト本文 {time_offset:.0f} 秒", start=time_offset, end=time_offset + 1, segment_id=0)]
+        tr.transcribe.side_effect = fake_transcribe
+
+        args = argparse.Namespace(verbose=False, timestamps=False, format="txt", output=str(Path(d) / "out"),
+                                  model="tiny", language="ja", segment_duration=3.0, overlap=0.5, save_interval=0,
+                                  login_timeout=5.0, player_marker="player.html")
+        session = BrowserSession(profile_dir=Path(d) / "profile", headless=True)
+        try:
+            session.start(timeout=90)
+            check("専用 Chrome 起動（ヘッドレス・別プロファイル）", True)
+            with patch("main._prompt_rename", side_effect=lambda p: p), patch("main._print_progress"):
+                entry = _process_one_url_page(url, 0, 1, tr, args, session, threading.Event())
+            check("E2E: 再生を実測できた (played=True)", entry["played"] is True, f"{entry}")
+            check("E2E: 終了を検出 (video.ended / 末尾)", entry["stop_reason"] in ("video.ended", "動画末尾に到達", "動画末尾に到達（巻き戻し検出）"),
+                  f"{entry['stop_reason']}")
+            check("E2E: タイトルをページから取得", entry["title"] == "テスト講義", f"{entry['title']}")
+            check("E2E: 音声がページ内から届き、逆相でも打ち消されない (RMS>0.15)", bool(rms_seen) and max(rms_seen) > 0.15,
+                  f"rms={[round(r, 3) for r in rms_seen]}")
+            check("E2E: 本文が書かれた", entry["qa"]["lines"] > 0 and Path(entry["output"]).exists())
+            check("E2E: 保存ボタンと離脱リンクをページ内で押した",
+                  session.evaluate("(window.__saved||0) >= 1 && window.__exited === true"))
+            check("E2E: qa.status=ok・video_seconds=8.0", entry["qa"]["status"] == "ok" and entry["qa"]["video_seconds"] == 8.0,
+                  f"{entry['qa']['status']} {entry['qa']['video_seconds']}")
+            check("E2E: 届いた音声秒数が動画長に近い", 6.0 <= entry["audio_seconds_received"] <= 20.0, f"{entry['audio_seconds_received']}")
+        finally:
+            session.close()
+            srv.shutdown()
+
+
+def test_course_page_dump_and_page_batch() -> None:
+    """#33: バッチ終了時のコースページ保存と、session 付き _run_batch が page 経路を通ること。"""
+    print("\n[42] course-page.txt 保存 / page エンジンのバッチ配線")
+    import argparse, json, tempfile
+    from unittest.mock import MagicMock, patch
+    from main import _dump_course_page, _run_batch
+
+    class S:
+        def __init__(self, url, text="シラバス\n最終レポートを提出してください"):
+            self._url = url; self._text = text; self.evals = 0
+        def url(self): return self._url
+        def evaluate(self, js): self.evals += 1; return self._text
+
+    with tempfile.TemporaryDirectory() as d:
+        s = S("https://m.example.com/moodle/course/view.php?id=1")
+        path = _dump_course_page(s, Path(d))
+        check("コースページに居れば course-page.txt を書く", path is not None and path.exists())
+        body = path.read_text(encoding="utf-8") if path else ""
+        check("1 行目が URL・本文を含む", body.startswith("# URL: https://m.example.com/moodle/course/view.php?id=1") and "最終レポート" in body)
+        s2 = S("https://m.example.com/moodle/mod/scorm/player.php?a=1")
+        check("プレーヤーに居るときは保存しない", _dump_course_page(s2, Path(d)) is None and s2.evals == 0)
+
+    # session を渡すと _process_one_url_page が使われ、終了時に course page を保存する
+    urls = ["https://m.example.com/x?a=1", "https://m.example.com/x?a=2"]
+    with tempfile.TemporaryDirectory() as d:
+        sess = S("https://m.example.com/moodle/course/view.php?id=1")
+        calls = {"page": 0, "bh": 0}
+        def page_runner(url, i, total, tr, args, session, stop_event):
+            calls["page"] += 1
+            return {"index": i, "url": url, "page_url": url, "title": f"講義{i}", "output": str(Path(d) / f"講義{i}.txt"),
+                    "stop_reason": "video.ended", "played": True, "elapsed_seconds": 1.0,
+                    "qa": {"status": "ok", "lines": 10, "chars": 300, "video_seconds": 60.0, "chars_per_min": 300.0,
+                           "repeated_ratio": 0.0, "hallucination_ratio": 0.0, "warnings": []}}
+        with patch("main._process_one_url_page", side_effect=page_runner), \
+             patch("main._process_one_url", side_effect=lambda *a, **k: calls.__setitem__("bh", calls["bh"] + 1)), \
+             patch("main.time.sleep"), patch("main.signal.signal"), \
+             patch("transcriber.Transcriber", return_value=MagicMock()), patch("subprocess.run"):
+            rc = _run_batch(urls, argparse.Namespace(model="tiny", language="ja", cpu_threads=4, restore_to=None,
+                                                     json_summary=None, output=d), session=sess)
+        check("session あり → page 経路のみ・全 URL", calls == {"page": 2, "bh": 0} and rc == 0, f"{calls} rc={rc}")
+        check("バッチ終了時に course-page.txt を保存", (Path(d) / "course-page.txt").exists())
+        check("run-summary.json も同じディレクトリ", (Path(d) / "run-summary.json").exists())
+
+    # 1 本目がプレーヤー未到達（output=None）でも落ちず、サマリーは args.output に書かれる
+    import subprocess as _sp
+    with tempfile.TemporaryDirectory() as d:
+        sess = S("https://m.example.com/moodle/course/view.php?id=1")
+        def runner(url, i, total, tr, args, session, stop_event):
+            if i == 0:
+                return {"index": 0, "url": url, "page_url": url, "title": None, "output": None,
+                        "stop_reason": "プレーヤー到達失敗", "played": False, "elapsed_seconds": 1.0,
+                        "qa": {"status": "failed", "lines": 0, "chars": 0, "video_seconds": -1.0, "chars_per_min": 0.0,
+                               "repeated_ratio": 0.0, "hallucination_ratio": 0.0, "warnings": ["x"]}}
+            return page_runner(url, i, total, tr, args, session, stop_event)
+        with patch("main._process_one_url_page", side_effect=runner), patch("main.time.sleep"), \
+             patch("main.signal.signal"), patch("transcriber.Transcriber", return_value=MagicMock()), patch("subprocess.run"):
+            rc = _run_batch(urls, argparse.Namespace(model="tiny", language="ja", cpu_threads=4, restore_to=None,
+                                                     json_summary=None, output=d), session=sess)
+        summary = Path(d) / "run-summary.json"
+        check("1 本目 output=None でも例外なく rc=2", rc == 2, f"rc={rc}")
+        check("サマリーは args.output 配下に書かれる", summary.exists())
+        doc = json.loads(summary.read_text()) if summary.exists() else {}
+        check("2 件とも記録・failed=1", doc.get("total") == 2 and doc.get("failed") == 1, f"{doc.get('total')} {doc.get('failed')}")
+        check("course-page.txt も同じディレクトリ（CWD ではない）", (Path(d) / "course-page.txt").exists())
+        # copy_to_downloads は output=None をスキップして落ちない
+        (Path(d) / "講義1.txt").write_text("x")
+        r = _sp.run([sys.executable, ".claude/skills/moodle-transcribe/copy_to_downloads.py", str(summary), "--dest", str(Path(d) / "dl")],
+                    capture_output=True, text=True)
+        check("copy_to_downloads: output=None をスキップし rc=0", r.returncode == 0 and "スキップ" in r.stdout, f"rc={r.returncode} {r.stdout[-200:]} {r.stderr[-200:]}")
+
+
+def test_wait_for_player_unit() -> None:
+    """#34: wait_for_player（ログイン待ち）を Chrome なしで拘束。永久ループ・中断・外部 SSO。"""
+    print("\n[43] BrowserSession.wait_for_player（単体）")
+    from browser import BrowserSession
+
+    class Stub(BrowserSession):
+        def __init__(self, urls):
+            self._urls = list(urls); self._i = 0; self.front = 0; self.pumps = 0
+        def url(self):
+            u = self._urls[min(self._i, len(self._urls) - 1)]; return u
+        def pump(self, ms=500):
+            self.pumps += 1; self._i += 1
+            time.sleep(ms / 1000.0)
+            if self.pumps > 20000:
+                raise RuntimeError("wait_for_player が終わらない（永久ループ）")
+        def bring_to_front(self): self.front += 1
+
+    P = "https://m.example.com/mod/scorm/player.php?a=1"
+    L = "https://m.example.com/login/index.php"
+    notified: list = []
+    s = Stub([L, L, P])
+    r = s.wait_for_player(timeout=0.5, login_timeout=5.0, on_login_required=notified.append, poll_ms=1)
+    check("login → player で URL を返す", r == P)
+    check("on_login_required は 1 回・bring_to_front は 1 回", len(notified) == 1 and s.front == 1, f"{len(notified)} {s.front}")
+
+    s = Stub([L])
+    t0 = time.monotonic(); r = s.wait_for_player(timeout=0.05, login_timeout=0.3, poll_ms=1); took = time.monotonic() - t0
+    check("login のまま → login_timeout で None", r is None and 0.25 < took < 2.0, f"{r} {took:.2f}s")
+
+    s = Stub(["https://m.example.com/mod/scorm/view.php?id=1"])
+    t0 = time.monotonic(); r = s.wait_for_player(timeout=0.2, login_timeout=5.0, poll_ms=1); took = time.monotonic() - t0
+    check("login 無し・marker 無し → timeout で None（timeout ぶんは待つ）", r is None and 0.2 <= took < 1.5, f"{took:.2f}s")
+
+    # 修正対象だった永久ループ: login → /my/（marker も login も含まない）
+    s = Stub([L, "https://m.example.com/my/"])
+    t0 = time.monotonic(); r = s.wait_for_player(timeout=0.05, login_timeout=0.3, poll_ms=1); took = time.monotonic() - t0
+    check("login → 非 marker ページ → login_timeout 以内に None（永久ループしない）", r is None and took < 2.0, f"{r} {took:.2f}s")
+
+    # 外部 SSO（/login/ を含まない idp ドメイン）もログイン待ち扱い
+    s = Stub(["https://idp.example.ac.jp/saml2/SSO", P])
+    r = s.wait_for_player(timeout=0.05, login_timeout=5.0, poll_ms=1)
+    check("外部 SSO (idp/saml) もログイン待ちとして扱い、戻れば URL", r == P and s.front == 1)
+    check("looks_like_login: 通常のコースページは誤判定しない",
+          not BrowserSession.looks_like_login("https://moodle.gs.chiba-u.jp/moodle/course/view.php?id=48556"))
+    negatives = ["https://moodle.gs.chiba-u.jp/moodle/mod/lesson/view.php?id=1",          # "sso" ⊂ lesson
+                 "https://moodle.gs.chiba-u.jp/moodle/mod/book/view.php?id=2&chapter=authors",  # "auth" ⊂ authors
+                 "https://moodle.gs.chiba-u.jp/moodle/mod/assign/view.php?id=3",
+                 "https://moodle.gs.chiba-u.jp/moodle/mod/scorm/player.php?a=1", "about:blank"]
+    positives = ["https://moodle.gs.chiba-u.jp/moodle/login/index.php", "https://idp.example.ac.jp/saml2/SSO",
+                 "https://moodle.gs.chiba-u.jp/moodle/auth/shibboleth/index.php", "https://sso.example.com/", 
+                 "https://login.microsoftonline.com/x", "https://m.example.com/Shibboleth.sso/Login"]
+    check("looks_like_login: lesson/authors/assign/player を誤判定しない", not any(BrowserSession.looks_like_login(u) for u in negatives),
+          f"{[u for u in negatives if BrowserSession.looks_like_login(u)]}")
+    check("looks_like_login: login/idp/auth/sso/shibboleth を拾う", all(BrowserSession.looks_like_login(u) for u in positives),
+          f"{[u for u in positives if not BrowserSession.looks_like_login(u)]}")
+
+    # 中断（Ctrl+C の stop_event）で即 None
+    s = Stub([L])
+    r = s.wait_for_player(timeout=5.0, login_timeout=600.0, should_abort=lambda: True, poll_ms=1)
+    check("should_abort → 即 None", r is None and s.pumps == 0)
+
+
+def test_browser_session_thread_boundary() -> None:
+    """#35: BrowserSession の _call / start / close（Playwright なし）。"""
+    print("\n[44] BrowserSession スレッド境界")
+    import queue as _q
+    from browser import BrowserSession
+
+    class Stub(BrowserSession):
+        def _run(self):
+            # Playwright を起こさずコマンドを捌くだけ
+            if getattr(self, "fail_start", False):
+                self._start_error = RuntimeError("chrome missing"); self._ready.set(); return
+            self._ready.set()
+            while not self._stop.is_set():
+                try:
+                    cmd = self._q.get(timeout=0.02)
+                except _q.Empty:
+                    continue
+                try:
+                    cmd.result = cmd.fn()
+                except BaseException as e:  # noqa: BLE001
+                    cmd.error = e
+                finally:
+                    cmd.done.set()
+
+    s = Stub(profile_dir="/tmp/x")
+    try:
+        s._call(lambda: 1)
+        check("未 start の _call → RuntimeError", False)
+    except RuntimeError:
+        check("未 start の _call → RuntimeError", True)
+    s.start(timeout=5)
+    check("start 後に _call が結果を返す", s._call(lambda: 41 + 1) == 42)
+    def boom(): raise ValueError("inner")
+    try:
+        s._call(boom); check("fn の例外は呼び出し側へ伝播", False)
+    except ValueError as e:
+        check("fn の例外は呼び出し側へ伝播", str(e) == "inner")
+    try:
+        s._call(lambda: time.sleep(0.3), timeout=0.05); check("timeout 超過 → TimeoutError", False)
+    except TimeoutError:
+        check("timeout 超過 → TimeoutError", True)
+    s.close()
+    check("close() 後は _thread が None", s._thread is None)
+
+    s2 = Stub(profile_dir="/tmp/x"); s2.fail_start = True
+    try:
+        s2.start(timeout=5); check("起動失敗 → start() が RuntimeError", False)
+    except RuntimeError as e:
+        check("起動失敗 → start() が RuntimeError（原因を保持）", "chrome missing" in str(e) and isinstance(e.__cause__, RuntimeError))
+
+
+def test_run_page_engine_branch() -> None:
+    """#36: run() の page 分岐（BrowserSession をパッチ）。"""
+    print("\n[45] run() の page エンジン分岐")
+    from unittest.mock import MagicMock, patch
+    from main import build_parser, run
+
+    def go(argv, start_error=None, batch_rc=0):
+        sess = MagicMock()
+        if start_error:
+            sess.start.side_effect = RuntimeError(start_error)
+        with patch("browser.BrowserSession", return_value=sess) as BS, \
+             patch("main._run_batch", return_value=batch_rc) as rb:
+            rc = run(build_parser().parse_args(argv))
+        return rc, sess, BS, rb
+
+    rc, sess, BS, rb = go(["--moodle-url", "https://m.example.com/mod/scorm/player.php?a=1", "--profile-dir", "/tmp/prof", "--headless"])
+    check("--moodle-url がフル URL なら 1 本のバッチに昇格", rb.called and rb.call_args.args[0] == ["https://m.example.com/mod/scorm/player.php?a=1"])
+    check("profile_dir / headless が BrowserSession に渡る", BS.call_args.kwargs["profile_dir"] == Path("/tmp/prof") and BS.call_args.kwargs["headless"] is True)
+    check("正常終了で session.close()", sess.close.called and rc == 0)
+
+    rc, sess, BS, rb = go(["--moodle-url", "example.com"])
+    check("URL 無し（パターンのみ）→ rc=1・ブラウザを起こさない", rc == 1 and not BS.called)
+
+    rc, sess, BS, rb = go(["--urls", "https://m.example.com/x?a=1"], start_error="no chrome")
+    check("start 失敗 → rc=1・バッチを回さない", rc == 1 and not rb.called)
+
+    rc, sess, BS, rb = go(["--urls", "https://m.example.com/x?a=1", "https://m.example.com/x?a=2"], batch_rc=2)
+    check("バッチの rc をそのまま返し、close する", rc == 2 and sess.close.called)
+
+
+def test_monitor_total_guard() -> None:
+    """#37: PlaybackMonitor.total は最後の poll で取得失敗(-1)しても直前の正の値を保つ。"""
+    print("\n[46] PlaybackMonitor.total の保持")
+    from unittest.mock import patch
+    from main import PlaybackMonitor
+    times = iter([(30.0, 262.0), (60.0, 262.0), (-1.0, -1.0)])
+    with patch("main.get_viewing_percentage", return_value=-1), patch("main.get_video_ended", return_value=False), \
+         patch("main.get_video_time", side_effect=lambda *a, **k: next(times)), patch("main._print_progress"):
+        m = PlaybackMonitor(1, "chrome")
+        for _ in range(3):
+            m.poll(silent=False)
+    check("取得失敗後も total=262 を保持", m.total == 262.0, f"{m.total}")
 
 if __name__ == "__main__":
     print("=" * 55)
@@ -1535,6 +2503,21 @@ if __name__ == "__main__":
     test_boundary_dedup_fuzzy()
     test_playback_monitor_rewind_after_end()
     test_callers_skip_save_exit_when_not_played()
+    test_qa_metrics()
+    test_run_batch_summary()
+    test_process_one_url_returns_entry()
+    test_qa_boundaries()
+    test_run_batch_interrupt_and_exception()
+    test_process_one_url_interrupt()
+    test_warn_other_audio_apps()
+    test_page_capture()
+    test_process_one_url_page()
+    test_page_engine_live()
+    test_course_page_dump_and_page_batch()
+    test_wait_for_player_unit()
+    test_browser_session_thread_boundary()
+    test_run_page_engine_branch()
+    test_monitor_total_guard()
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

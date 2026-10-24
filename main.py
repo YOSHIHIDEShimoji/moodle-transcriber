@@ -224,10 +224,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile-dir", default=None,
         help="page エンジンの Chrome プロファイル（既定: ~/.moodle-transcriber/chrome-profile）",
     )
-    p.add_argument("--headless", action="store_true", help="page エンジンのブラウザを非表示で起動（ログインが必要なときは使えない）")
+    p.add_argument(
+        "--headless", action="store_true",
+        help="page エンジンのブラウザを常に非表示で起動（ログイン画面に落ちたら失敗扱い。無人 cron 向け）",
+    )
+    p.add_argument(
+        "--show-browser", action="store_true",
+        help="page エンジンのブラウザを常にウィンドウ付きで起動（既定: 非表示。ログインが必要なときだけ自動でウィンドウを出す）",
+    )
     p.add_argument(
         "--login-timeout", type=float, default=600.0,
         help="page エンジンでログイン画面に落ちたとき、本人のログインを待つ秒数（既定 600）",
+    )
+    p.add_argument(
+        "--speed", type=float, default=1.0,
+        help="page エンジンの再生速度（1.0〜3.0）。preservesPitch を切った早回しを 16000×速度 Hz で取り、"
+             "元の速度・ピッチに戻して文字起こしする。Chrome は 4 倍超で音声をミュートするため上限 3",
     )
     p.add_argument(
         "--player-marker", default="player.php",
@@ -386,13 +398,17 @@ class PlaybackMonitor:
         browser: str,
         retrigger: "Callable[[], None] | None" = None,
         probe: "object | None" = None,
+        near_end_margin: float = 5.0,
     ):
         """probe: pct() / ended() / time() を持つオブジェクト。None なら従来の
-        AppleScript 経路（platform_utils の関数）を使う。page エンジンは BrowserSession を渡す。"""
+        AppleScript 経路（platform_utils の関数）を使う。page エンジンは BrowserSession を渡す。
+        near_end_margin: 「末尾付近まで再生した」とみなす残り秒数。poll 間隔（セグメント長）より
+        小さいと末尾を取り逃がして巻き戻し検出が効かず、停滞判定まで約 100 秒待つ（2026-10-24 実測）。"""
         self._target = target
         self._browser = browser
         self._retrigger = retrigger
         self._probe = probe
+        self._near_end_margin = max(5.0, float(near_end_margin))
         self._last_cur = -1.0
         self._stall = 0
         self._near_end = 0
@@ -485,7 +501,7 @@ class PlaybackMonitor:
         # 停滞判定（約 75 秒）を待たずに終了扱いにする。
         if cur >= 0:
             self._max_cur = max(self._max_cur, cur)
-            if (self.played and total > 0 and self._max_cur >= total - 5.0
+            if (self.played and total > 0 and self._max_cur >= total - self._near_end_margin
                     and cur < self.STARTED_CUR):
                 return True, "動画末尾に到達（巻き戻し検出）"
 
@@ -608,7 +624,8 @@ def _process_one_url(
     _trigger_with_retry(target, browser)
 
     monitor = PlaybackMonitor(target, browser,
-                              retrigger=lambda: _trigger_with_retry(target, browser))
+                              retrigger=lambda: _trigger_with_retry(target, browser),
+                              near_end_margin=args.segment_duration)
     texts: list[str] = []
     stop_reason = ""
     elapsed = 0.0
@@ -811,11 +828,15 @@ class _SessionProbe:
         return st.current_time, st.duration
 
 
-def _page_play_with_retry(session: "BrowserSession", attempts: int = 5, settle: float = 0.5) -> bool:
-    """video.play() を呼び、実際に paused=false になったことを確認する。"""
+def _page_play_with_retry(session: "BrowserSession", attempts: int = 5, settle: float = 0.5,
+                          rate: float = 1.0) -> bool:
+    """video.play() を呼び、実際に paused=false になったことを確認する。rate != 1 なら再生速度も設定する。"""
     for i in range(attempts):
         res = session.play()
         logger.debug("page play() -> %r (attempt %d)", res, i + 1)
+        if rate != 1.0:
+            actual = session.set_playback_rate(rate)
+            logger.debug("page playbackRate -> %s (requested %s)", actual, rate)
         for _ in range(6):
             time.sleep(settle)
             st = session.state()
@@ -878,9 +899,59 @@ def _process_one_url_page(
                    f"（{int(args.login_timeout // 60)} 分待ちます）"))
         logger.info("login required: %s", login_url)
 
-    actual_url = session.wait_for_player(contains=getattr(args, "player_marker", "player.php"),
-                                         timeout=60.0, login_timeout=args.login_timeout,
-                                         on_login_required=_on_login, should_abort=stop_event.is_set)
+    marker = getattr(args, "player_marker", "player.php")
+    force_headless = getattr(args, "headless", False)
+    # ヘッドレス中はログイン画面で待っても本人が操作できない。login_timeout=0 で即戻し、
+    # ログイン画面ならウィンドウ付きで起こし直して本人のログインを待つ（--headless 強制時は失敗扱い）。
+    actual_url = session.wait_for_player(contains=marker, timeout=60.0,
+                                         login_timeout=0.0 if session.headless else args.login_timeout,
+                                         on_login_required=None if session.headless else _on_login,
+                                         should_abort=stop_event.is_set)
+    if (actual_url is None and session.headless and not stop_event.is_set()
+            and session.looks_like_login(session.url())):
+        if force_headless:
+            logger.warning("login required but --headless forced: %s", session.url())
+            print(_YLW("  ログインが必要ですが --headless 指定のためウィンドウを出せません。--headless を外して再実行してください"))
+            return _entry(None, session.url(), None, [], "プレーヤー到達失敗", False, -1.0)
+        logger.info("login required (headless) → relaunch with window")
+        print(_YLW("  ログインが必要です。専用ブラウザのウィンドウを開きます..."))
+        try:
+            session.relaunch(headless=False)
+        except RuntimeError as e:
+            logger.warning("browser relaunch failed: %s", e)
+            print(_YLW(f"  専用ブラウザの再起動に失敗しました: {e}"))
+            return _entry(None, url, None, [], "ブラウザ再起動失敗", False, -1.0)
+        session.goto(url)
+        actual_url = session.wait_for_player(contains=marker, timeout=60.0, login_timeout=args.login_timeout,
+                                             on_login_required=_on_login, should_abort=stop_event.is_set)
+        if (actual_url is not None and not stop_event.is_set()
+                and not getattr(session, "login_lost_in_headless", False)):
+            # ログイン済みの Cookie はプロファイルに残るはず。ウィンドウを消してヘッドレスへ戻す
+            logger.info("login done → relaunch headless")
+            print(_DIM("  ログインを確認。ウィンドウを閉じて非表示で続行します"))
+            try:
+                session.relaunch(headless=True)
+            except RuntimeError as e:
+                logger.warning("browser relaunch failed: %s", e)
+                print(_YLW(f"  専用ブラウザの再起動に失敗しました: {e}"))
+                return _entry(None, url, None, [], "ブラウザ再起動失敗", False, -1.0)
+            session.goto(url)
+            actual_url = session.wait_for_player(contains=marker, timeout=60.0, login_timeout=0.0,
+                                                 should_abort=stop_event.is_set)
+            if (actual_url is None and not stop_event.is_set() and session.looks_like_login(session.url())):
+                # ヘッドレス再起動でセッション Cookie が捨てられた。以後この実行はウィンドウ付きで続ける
+                logger.warning("login not preserved across headless relaunch → continue with window")
+                print(_YLW("  非表示モードではログインが保持されませんでした。この実行はウィンドウ付きで続行します"))
+                session.login_lost_in_headless = True
+                try:
+                    session.relaunch(headless=False)
+                except RuntimeError as e:
+                    logger.warning("browser relaunch failed: %s", e)
+                    print(_YLW(f"  専用ブラウザの再起動に失敗しました: {e}"))
+                    return _entry(None, url, None, [], "ブラウザ再起動失敗", False, -1.0)
+                session.goto(url)
+                actual_url = session.wait_for_player(contains=marker, timeout=60.0, login_timeout=args.login_timeout,
+                                                     on_login_required=_on_login, should_abort=stop_event.is_set)
     if stop_event.is_set():
         return _entry(None, session.url(), None, [], "", False, -1.0)
     if actual_url is None:
@@ -915,29 +986,35 @@ def _process_one_url_page(
     writer = OutputWriter(output_path, fmt, args.model, args.language,
                           title=page_title, page_url=page_url,
                           backend=getattr(transcriber, "backend_desc", None))
+    speed = float(getattr(args, "speed", 1.0) or 1.0)
+    if not (0.5 <= speed <= 3.0):
+        raise ValueError(f"--speed は 0.5〜3.0 の範囲で指定してください: {speed}")
+    want_sr = int(round(16000 * speed))
     capture = PageAudioCapture(args.segment_duration, args.overlap)
     capture.start()
     session.set_chunk_sink(capture.feed_b64)
-    cap_res = session.start_capture()
-    logger.info("page capture: %s", cap_res)
+    cap_res = session.start_capture(sample_rate=want_sr)
+    logger.info("page capture: %s (speed=%.2f, want sr=%d)", cap_res, speed, want_sr)
     if cap_res == "no_video":
         writer.finalize()
         print(_YLW("  動画要素が見つかりませんでした"))
         return _entry(page_title, page_url, output_path, [], "動画要素なし", False, -1.0)
     m_sr = re.search(r"sr=(\d+)", cap_res or "")
-    if m_sr and int(m_sr.group(1)) != 16000:
-        # AudioContext が 16kHz を拒否して既定レートで動いている。Python 側は 16kHz 前提なので
+    if m_sr and int(m_sr.group(1)) != want_sr:
+        # AudioContext が要求レートを拒否して既定レートで動いている。Python 側は 16000×速度 Hz 前提なので
         # 速度違いの音声になり文字起こしが壊れる。偽成功にせず失敗で止める。
         writer.finalize()
-        logger.warning("page capture sample rate mismatch: %s", cap_res)
-        print(_YLW(f"  キャプチャのサンプルレートが 16kHz ではありません ({cap_res})"))
+        logger.warning("page capture sample rate mismatch: %s (want %d)", cap_res, want_sr)
+        print(_YLW(f"  キャプチャのサンプルレートが {want_sr} Hz ではありません ({cap_res})"))
         return _entry(page_title, page_url, output_path, [], f"キャプチャのサンプルレート不一致 ({cap_res})", False, -1.0)
 
-    print(f"\n{_BGRN('▶  文字起こし開始')}  {_DIM('Ctrl+C で全停止')}\n")
-    _page_play_with_retry(session)
+    speed_note = f"  {_DIM(f'再生速度 {speed:g}x')}" if speed != 1.0 else ""
+    print(f"\n{_BGRN('▶  文字起こし開始')}  {_DIM('Ctrl+C で全停止')}{speed_note}\n")
+    _page_play_with_retry(session, rate=speed)
 
     probe = _SessionProbe(session)
-    monitor = PlaybackMonitor(url, "page", retrigger=lambda: _page_play_with_retry(session), probe=probe)
+    monitor = PlaybackMonitor(url, "page", retrigger=lambda: _page_play_with_retry(session, rate=speed), probe=probe,
+                              near_end_margin=args.segment_duration)
     texts: list[str] = []
     stop_reason = ""
     last_save = time.monotonic()
@@ -983,6 +1060,14 @@ def _process_one_url_page(
                 continue   # 停止決定後は残りセグメントを流し切るだけ
             elapsed = segment.start_time + len(segment.data) / 16000.0
             should_stop, reason = monitor.poll(silent=silent, elapsed=elapsed)
+            if speed != 1.0 and not should_stop:
+                # プレーヤーが rate を 1 に戻すことがある（SCORM 教材の独自 UI）。都度戻す
+                try:
+                    actual = session.set_playback_rate(speed)
+                    if actual > 0 and abs(actual - speed) > 0.05:
+                        logger.warning("playbackRate drifted: %s (want %s)", actual, speed)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("set_playback_rate: %s", e)
             if args.save_interval > 0 and time.monotonic() - last_save >= args.save_interval:
                 session.click_save()
                 last_save = time.monotonic()
@@ -1012,6 +1097,7 @@ def _process_one_url_page(
         output_path = _prompt_rename(output_path)
     entry = _entry(page_title, page_url, output_path, texts, stop_reason, monitor.played, monitor.total)
     entry["audio_seconds_received"] = round(capture.seconds_received, 1)
+    entry["speed"] = speed
     if monitor.played and monitor.total > 0 and capture.seconds_received < monitor.total * 0.5:
         entry["qa"]["warnings"].append(
             f"届いた音声が動画長の半分未満: {capture.seconds_received:.0f}s / {monitor.total:.0f}s")
@@ -1187,6 +1273,9 @@ def run(args: argparse.Namespace) -> int:
 
     # ── page エンジン（既定）: 専用 Chrome + ページ内キャプチャ。ユーザーの Chrome には触らない ──
     if args.engine == "page":
+        if not (0.5 <= float(getattr(args, "speed", 1.0) or 1.0) <= 3.0):
+            print(f"エラー: --speed は 0.5〜3.0 の範囲で指定してください（指定: {args.speed}）", file=sys.stderr)
+            return 1
         if not urls and args.moodle_url and args.moodle_url.startswith("http"):
             urls = [args.moodle_url]
         if not urls:
@@ -1196,7 +1285,8 @@ def run(args: argparse.Namespace) -> int:
         from browser import BrowserSession, DEFAULT_PROFILE_DIR
         profile = Path(args.profile_dir).expanduser() if args.profile_dir else DEFAULT_PROFILE_DIR
         print(f"  専用 Chrome を起動中... {_DIM(str(profile))}")
-        session = BrowserSession(profile_dir=profile, headless=args.headless)
+        # 既定は非表示。ログイン画面に落ちたときだけ _process_one_url_page がウィンドウ付きで起こし直す
+        session = BrowserSession(profile_dir=profile, headless=not args.show_browser)
         try:
             session.start()
         except RuntimeError as e:

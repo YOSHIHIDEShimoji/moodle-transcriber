@@ -47,13 +47,16 @@ CHROME_ARGS = [
 # - ステレオをそのまま送る（逆相ステレオは Python 側 downmix_to_mono で処理）。
 # - destination には繋がない（無音）。ScriptProcessor は出力先が無いと止まる実装が
 #   あるため、gain=0 を経由して destination に繋ぐ。
-CAPTURE_JS = r"""
+# %d には AudioContext のサンプルレートが入る。再生速度 r 倍のときは 16000*r にする:
+# preservesPitch=false の r 倍速はただの早回し（波形を時間方向に 1/r に縮めたもの）なので、
+# 16000*r Hz で取ったサンプルを 16000 Hz として扱えば元の速度・元のピッチに戻る。
+CAPTURE_JS_TEMPLATE = r"""
 (() => {
   const v = document.querySelector('video');
   if (!v) return 'no_video';
   if (window.__mtCap) return 'already';
   let ctx;
-  try { ctx = new AudioContext({sampleRate: 16000}); } catch (e) { ctx = new AudioContext(); }
+  try { ctx = new AudioContext({sampleRate: %d}); } catch (e) { ctx = new AudioContext(); }
   const src = ctx.createMediaElementSource(v);
   const proc = ctx.createScriptProcessor(4096, 2, 2);
   src.connect(proc);
@@ -78,6 +81,22 @@ CAPTURE_JS = r"""
   window.__mtCap = {ctx, proc, src, get count() { return n; }};
   ctx.resume();
   return 'capturing sr=' + ctx.sampleRate + ' state=' + ctx.state;
+})()
+"""
+CAPTURE_JS = CAPTURE_JS_TEMPLATE % 16000
+
+# 再生速度を設定する。r != 1 のとき preservesPitch=false（ピッチ補正なしの早回し）にする。
+# プレーヤーが rate を 1 に戻すことがあるので、毎 poll で呼び直す。
+SET_RATE_JS_TEMPLATE = r"""
+(() => {
+  const v = document.querySelector('video');
+  if (!v) return -1;
+  const r = %s;
+  try { v.defaultPlaybackRate = r; } catch (e) {}
+  try { v.playbackRate = r; } catch (e) {}
+  try { v.preservesPitch = (r === 1); } catch (e) {}
+  try { v.mozPreservesPitch = (r === 1); } catch (e) {}
+  return v.playbackRate;
 })()
 """
 
@@ -125,7 +144,7 @@ VIDEO_STATE_JS = r"""
   return {
     paused: v.paused, ended: v.ended,
     currentTime: v.currentTime, duration: isFinite(v.duration) ? v.duration : -1,
-    readyState: v.readyState, muted: v.muted,
+    readyState: v.readyState, muted: v.muted, playbackRate: v.playbackRate,
     captureCount: c ? c.count : -1, ctxState: c ? c.ctx.state : '',
   };
 })()
@@ -176,6 +195,7 @@ class VideoState:
     duration: float = -1.0
     capture_count: int = -1
     ctx_state: str = ""
+    playback_rate: float = 1.0
 
     @property
     def playing(self) -> bool:
@@ -226,13 +246,32 @@ class BrowserSession:
         self._video_frame = None
 
     # ── ライフサイクル ───────────────────────────────────────────────────
+    @property
+    def headless(self) -> bool:
+        return self._headless
+
     def start(self, timeout: float = 60.0) -> None:
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._start_error = None
         self._thread = threading.Thread(target=self._run, name="browser", daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout):
             raise RuntimeError("専用ブラウザの起動がタイムアウトしました")
         if self._start_error is not None:
             raise RuntimeError(f"専用ブラウザの起動に失敗: {self._start_error}") from self._start_error
+
+    def relaunch(self, headless: bool, timeout: float = 60.0) -> None:
+        """同じプロファイルで headless を切り替えて起動し直す（Cookie は残る）。
+
+        既定運用: 普段はヘッドレス、ログインが必要なときだけウィンドウ付きで起こし、
+        ログイン後に再びヘッドレスへ戻す。chunk sink は維持する。
+        """
+        sink = self._sink
+        self.close()
+        self._headless = headless
+        self.start(timeout=timeout)
+        self.set_chunk_sink(sink)
 
     def close(self) -> None:
         if self._thread is None:
@@ -368,12 +407,21 @@ class BrowserSession:
     def has_video(self) -> bool:
         return self._call(lambda: self._find_video_frame() is not None, timeout=20)
 
-    def start_capture(self) -> str:
+    def start_capture(self, sample_rate: int = 16000) -> str:
         def _fn():
             f = self._find_video_frame()
             if f is None:
                 return "no_video"
-            return f.evaluate(CAPTURE_JS)
+            return f.evaluate(CAPTURE_JS_TEMPLATE % int(sample_rate))
+        return self._call(_fn, timeout=20)
+
+    def set_playback_rate(self, rate: float) -> float:
+        """video.playbackRate を設定し、実際の値を返す（video が無ければ -1）。"""
+        def _fn():
+            f = self._find_video_frame()
+            if f is None:
+                return -1.0
+            return float(f.evaluate(SET_RATE_JS_TEMPLATE % repr(float(rate))))
         return self._call(_fn, timeout=20)
 
     def stop_capture(self) -> str:
@@ -407,15 +455,21 @@ class BrowserSession:
                 found=True, paused=bool(d["paused"]), ended=bool(d["ended"]),
                 current_time=float(d["currentTime"]), duration=float(d["duration"]),
                 capture_count=int(d["captureCount"]), ctx_state=str(d["ctxState"]),
+                playback_rate=float(d.get("playbackRate", 1.0) or 1.0),
             )
         return self._call(_fn, timeout=20)
 
     def viewing_percentage(self) -> int:
+        """『視聴状況 XX%』をメインフレーム→他フレームの順で探す（SCORM 構成により位置が違う）。"""
         def _fn():
-            try:
-                return int(self._page.main_frame.evaluate(PCT_JS))
-            except Exception:  # noqa: BLE001
-                return -1
+            for fr in [self._page.main_frame] + [f for f in self._page.frames if f is not self._page.main_frame]:
+                try:
+                    v = int(fr.evaluate(PCT_JS))
+                except Exception:  # noqa: BLE001
+                    continue
+                if v >= 0:
+                    return v
+            return -1
         return self._call(_fn, timeout=20)
 
     def evaluate(self, js: str) -> Any:

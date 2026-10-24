@@ -257,3 +257,17 @@ non_blocking 対応: `looks_like_login` をパス区切り／ホスト名ベー�
 過剰一致を解消、負例・正例をテストで固定）、キャプチャの `sr=` を検査して 16kHz 以外は failed、
 「届いた音声が動画長の半分未満」の status 格上げを拘束、wait_for_player の timeout 下限、
 Stub.pump の回数上限（永久ループを例外に）。SKILL.md の入力仕様を player.php に限定。
+
+## 追記 2026-10-24 (4): ヘッドレス既定と `--speed`
+
+- **既定を非表示に**: 専用 Chrome はヘッドレスで起動し、ログイン画面に落ちたときだけウィンドウ付きで
+  `relaunch(False)` → 本人がログイン → `relaunch(True)` で非表示に戻す。`--show-browser` で常時表示、
+  `--headless` で常時非表示（ログイン要なら失敗扱い、無人 cron 向け）。macOS には「特定デスクトップに
+  ウィンドウを開く」API が無く、Dock の割り当ては Google Chrome 全体（本人の Chrome も）に効くため、
+  「出さない」が正解と判断。
+- **`--speed r`**（0.5〜3.0）: `preservesPitch=false` の r 倍速は波形の時間圧縮なので、AudioContext を
+  16000×r Hz にして取ったサンプルを 16kHz として扱えば元の速度・ピッチに戻る。PageAudioCapture は無変更。
+  プレーヤーが rate を 1 に戻すことがあるため poll ごとに再設定。Chrome は 4 倍超で音声をミュートするので上限 3。
+  実機 E2E（ヘッドレス・8 秒の 440Hz トーン）: 2x で所要 5.3 秒（1x は 9.7 秒）、届いた音声 8.2 秒、
+  FFT ピーク 440Hz（ピッチ補正が効いていれば 220Hz に下がる＝切れていることの直接確認）。
+  Moodle の視聴状況が 2x でも 100% になるかは実機で 1 本確認してから既定を上げる。

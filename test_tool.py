@@ -1367,6 +1367,25 @@ def test_playback_monitor_rewind_after_end() -> None:
     check("巻き戻し直後に終了", r[-1][0] and "巻き戻し" in r[-1][1], f"last={r[-1]}")
     check("それ以前は継続", not any(s for s, _ in r[:3]))
 
+    # 2026-10-24 実測: 25 秒間隔の poll では末尾 5 秒以内を取り逃がし（max_cur=656.1, total=663.9）、
+    # 巻き戻し検出が効かず停滞判定まで約 100 秒待った。余裕をセグメント長に合わせると即終了する
+    times_m = iter([(600.0, 663.9), (631.9, 663.9), (656.1, 663.9), (0.0, 663.9)])
+    with patch("main.get_viewing_percentage", return_value=-1), \
+         patch("main.get_video_ended", return_value=False), \
+         patch("main.get_video_time", side_effect=lambda *a, **kw: next(times_m)), \
+         patch("main._print_progress"):
+        m3 = PlaybackMonitor(1, "chrome", near_end_margin=30.0)
+        r3 = [m3.poll(silent=False, elapsed=i * 25.0) for i in range(4)]
+    check("余裕 30 秒: 末尾 7.8 秒手前からの巻き戻しも即終了", r3[-1][0] and "巻き戻し" in r3[-1][1], f"last={r3[-1]}")
+    times_d = iter([(600.0, 663.9), (656.1, 663.9), (0.0, 663.9)])
+    with patch("main.get_viewing_percentage", return_value=-1), \
+         patch("main.get_video_ended", return_value=False), \
+         patch("main.get_video_time", side_effect=lambda *a, **kw: next(times_d)), \
+         patch("main._print_progress"):
+        m4 = PlaybackMonitor(1, "chrome")
+        r4 = [m4.poll(silent=False, elapsed=i * 25.0) for i in range(3)]
+    check("既定の余裕 5 秒では同じ系列で巻き戻し終了しない（余裕の効果を拘束）", not r4[-1][0], f"last={r4[-1]}")
+
     # 途中（末尾未到達）で 0 に戻った場合は巻き戻し終了にしない
     times2 = iter([(30.0, 262.0), (60.0, 262.0), (0.0, 262.0)])
     with patch("main.get_viewing_percentage", return_value=20), \
@@ -1929,13 +1948,22 @@ class _FakeSession:
     def __init__(self, play_ok=True, player_url="https://m.example.com/mod/scorm/player.php?a=1",
                  duration=60.0, stop_event=None, interrupt_after=None, feed_seconds=0.0,
                  has_video=True, capture_result="capturing sr=16000 state=running", lazy_chunks=None,
-                 continuous=False, max_state_calls=400):
+                 continuous=False, max_state_calls=400, headless=False, login_first=False):
         """continuous=True: 本番の ScriptProcessor と同じく、state() が呼ばれるたびに 1 秒ぶんの
         チャンクを**動画終了後も無音で**供給し続ける（タイムアウト経路が救済できない条件）。
         max_state_calls: 止まらない回帰をハングでなく例外（赤）にする上限。"""
         import base64
         self._continuous = continuous
         self._max_state_calls = max_state_calls
+        self.headless = headless
+        self.relaunches: list[bool] = []
+        self._navigated = True          # relaunch 後は goto されるまで about:blank
+        self.login_again_after_headless = False   # ヘッドレス再起動でセッションが消える環境を模す
+        self.relaunch_error = None
+        # login_first: 最初の wait はログイン画面（headless なら即 None）。ウィンドウ付きで起き直した後は
+        # 本人がログインしたものとしてプレーヤー URL を返す
+        self._login_pending = login_first
+        self.wait_calls: list[dict] = []
         self.play_ok = play_ok
         self.player_url = player_url
         self.duration = duration
@@ -1958,25 +1986,68 @@ class _FakeSession:
         self._b64_silence = base64.b64encode(np.zeros(sr * 2, dtype=np.int16).tobytes()).decode()
 
     def set_chunk_sink(self, sink): self.sink = sink
-    def goto(self, url): self.calls.append("goto"); return url
-    def url(self): return self.player_url or "https://m.example.com/login/index.php"
+    def goto(self, url): self.calls.append("goto"); self._navigated = True; return url
+    def url(self):
+        if not self._navigated:
+            return "about:blank"
+        if self._at_login or self.player_url is None:
+            return "https://m.example.com/login/index.php"
+        return self.player_url
     def title(self): return "講義X | コース | Moodle"
     def pump(self, ms=200): pass
     def has_video(self): return self._has_video
+    def looks_like_login(self, url):
+        from browser import BrowserSession
+        return BrowserSession.looks_like_login(url)
+    def relaunch(self, headless, timeout=60.0):
+        if self.relaunch_error:
+            raise RuntimeError(self.relaunch_error)
+        self.relaunches.append(headless)
+        self.headless = headless
+        self.calls.append(f"relaunch({headless})")
+        self._navigated = False                    # 本番と同じく about:blank から
+        if headless and self.login_again_after_headless:
+            self._login_pending = True             # セッション Cookie が消えた → 再びログイン画面
     def wait_for_player(self, contains="player.php", timeout=60.0, login_timeout=600.0,
                         on_login_required=None, should_abort=None, poll_ms=500):
         self.wait_args = {"contains": contains, "timeout": timeout, "login_timeout": login_timeout,
                           "has_abort": should_abort is not None}
+        self.wait_calls.append({**self.wait_args, "headless": self.headless, "notified": on_login_required is not None})
+        if not self._navigated:
+            return None                            # about:blank では marker もログインも見つからない
+        if self._login_pending:
+            if self.headless or login_timeout <= 0:
+                self._at_login = True
+                return None              # ヘッドレスでは待たずに戻る（本人は操作できない）
+            # ウィンドウ付き: 本人がログインしたとみなす
+            if on_login_required: on_login_required("https://m.example.com/login/index.php")
+            self._login_pending = False
+            self._at_login = False
+            return self.player_url
         if self.player_url is None:
             if on_login_required: on_login_required("https://m.example.com/login/index.php")
             return None
         return self.player_url
-    def start_capture(self):
+    _at_login = False
+    def start_capture(self, sample_rate=16000):
         self.calls.append("start_capture")
+        self.capture_sr_requested = sample_rate
         if self._capture_result != "no_video" and self.sink is not None:
             for _ in range(int(self._feed_seconds)):
                 self.sink(self._b64_tone if self.play_ok else self._b64_silence)
+        if self._capture_result == "echo":
+            # AudioContext が要求レートを受け入れた形
+            return f"capturing sr={sample_rate} state=running"
         return self._capture_result
+    rates: list = None
+    def set_playback_rate(self, rate):
+        if self.rates is None:
+            self.rates = []
+        self.calls.append("rate")
+        self.rates.append(rate)
+        self.playback_rate = rate
+        return rate
+    playback_rate = 1.0
     def stop_capture(self): self.calls.append("stop_capture"); return "stopped"
     def play(self):
         self.calls.append("play")
@@ -2002,7 +2073,8 @@ class _FakeSession:
             # 再生中はトーン、未再生・終了後は無音。チャンクは枯れない
             self.sink(self._b64_tone if (self.playing and not ended) else self._b64_silence)
         return VideoState(found=True, paused=not self.playing or ended, ended=ended,
-                          current_time=self.cur, duration=self.duration, capture_count=1, ctx_state="running")
+                          current_time=self.cur, duration=self.duration, capture_count=1, ctx_state="running",
+                          playback_rate=self.playback_rate)
     def viewing_percentage(self): return int(self.cur / self.duration * 100) if self.playing else 0
     def click_save(self): self.calls.append("save"); return True
     def click_exit(self): self.calls.append("exit"); return True
@@ -2019,7 +2091,7 @@ def test_process_one_url_page() -> None:
     def mk_args(d, seg=1.0, ov=0.0):
         return argparse.Namespace(verbose=False, timestamps=False, format="txt", output=d, model="tiny",
                                   language="ja", segment_duration=seg, overlap=ov, save_interval=0,
-                                  login_timeout=5.0, player_marker="player.php")
+                                  login_timeout=5.0, player_marker="player.php", headless=False, speed=1.0)
     def mk_tr():
         tr = MagicMock()
         tr.transcribe.side_effect = lambda data, time_offset=0.0: [TranscriptSegment(text=f"本文 {time_offset:.0f} 秒の説明です。", start=time_offset, end=time_offset + 1, segment_id=0)]
@@ -2156,6 +2228,111 @@ def test_process_one_url_page() -> None:
     check("半分未満: 字/分が十分でも status は warn に格上げ", entry["qa"]["status"] == "warn" and entry["qa"]["chars_per_min"] >= 40,
           f"{entry['qa']['status']} cpm={entry['qa']['chars_per_min']} {entry['qa']['warnings']}")
 
+    # 11) 既定（ヘッドレス）でログインが必要 → ウィンドウ付きで起き直し → ログイン → ヘッドレスに戻して続行
+    msgs: list = []
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"), patch("builtins.print", side_effect=lambda *a, **k: msgs.append(" ".join(str(x) for x in a))):
+        sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=2, continuous=True, headless=True, login_first=True)
+        a = mk_args(d); a.login_timeout = 77.0; a.headless = False
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), a, sess, threading.Event())
+    check("ヘッドレス+ログイン要: ウィンドウ付き→ログイン→ヘッドレスへ起き直す順", sess.relaunches == [False, True], f"{sess.relaunches}")
+    check("ヘッドレス中はログイン待ちしない（login_timeout=0・通知なし）",
+          sess.wait_calls[0]["login_timeout"] == 0.0 and sess.wait_calls[0]["notified"] is False, f"{sess.wait_calls[0]}")
+    check("ウィンドウ付きの待ちでは本人の login_timeout を使い通知する",
+          sess.wait_calls[1]["login_timeout"] == 77.0 and sess.wait_calls[1]["notified"] is True, f"{sess.wait_calls[1]}")
+    check("ログイン後に処理が完走する（ok）", entry["qa"]["status"] == "ok" and entry["played"] is True, f"{entry['qa']['status']}")
+    check("ログイン案内と非表示復帰のメッセージを出す", any("ログインが必要" in m for m in msgs) and any("非表示で続行" in m for m in msgs))
+    check("呼び出し順: goto → relaunch(False) → goto → relaunch(True) → goto → start_capture（relaunch 直後に必ず goto）",
+          sess.calls[:6] == ["goto", "relaunch(False)", "goto", "relaunch(True)", "goto", "start_capture"], f"{sess.calls[:7]}")
+    check("ヘッドレスへ戻した後の wait は login_timeout=0・通知なし",
+          sess.wait_calls[2]["login_timeout"] == 0.0 and sess.wait_calls[2]["notified"] is False and sess.wait_calls[2]["headless"] is True,
+          f"{sess.wait_calls[2]}")
+
+    # 16) ヘッドレス再起動でログインが保持されない環境 → ウィンドウ付きに戻して続行（ok）
+    msgs16: list = []
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"), patch("builtins.print", side_effect=lambda *a, **k: msgs16.append(" ".join(str(x) for x in a))):
+        sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=2, continuous=True, headless=True, login_first=True)
+        sess.login_again_after_headless = True
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), mk_args(d), sess, threading.Event())
+    check("再ログイン画面: relaunch 順 [False, True, False] で ok", sess.relaunches == [False, True, False] and entry["qa"]["status"] == "ok",
+          f"{sess.relaunches} {entry['qa']['status']} {entry['stop_reason']}")
+    check("再ログイン画面: 『ウィンドウ付きで続行』を案内し、session に記憶", any("ウィンドウ付きで続行" in m for m in msgs16)
+          and getattr(sess, "login_lost_in_headless", False) is True)
+    # 同じ session で次の URL: ヘッドレスへ戻そうとしない
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess._login_pending = True; sess._at_login = False
+        sess.cur = 0.0; sess.playing = False; sess.state_calls = 0   # 前の動画の再生状態をリセット
+        before = len(sess.relaunches)
+        entry = _process_one_url_page(sess.player_url, 1, 2, mk_tr(), mk_args(d), sess, threading.Event())
+    check("次の URL: ウィンドウ付きのまま（headless へ戻さない）", sess.relaunches[before:] in ([], [False]) and True not in sess.relaunches[before:]
+          and entry["qa"]["status"] == "ok", f"{sess.relaunches[before:]} {entry['qa']['status']}")
+
+    # 17) ヘッドレスで到達失敗だがログイン画面ではない（想定外ページ）→ ウィンドウを出さず failed
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._print_progress"):
+        sess = _FakeSession(player_url="https://m.example.com/my/", headless=True)
+        sess.wait_for_player = lambda **kw: None
+        entry = _process_one_url_page("https://m.example.com/mod/scorm/player.php?a=1", 0, 1, mk_tr(), mk_args(d), sess, threading.Event())
+    check("想定外ページ: relaunch せず failed", sess.relaunches == [] and entry["qa"]["status"] == "failed", f"{sess.relaunches}")
+
+    # 18) relaunch が失敗 → Traceback にせず failed entry（次の URL へ進める）
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._print_progress"):
+        sess = _FakeSession(headless=True, login_first=True); sess.relaunch_error = "chrome crashed"
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), mk_args(d), sess, threading.Event())
+    check("relaunch 失敗: failed entry（ブラウザ再起動失敗）で返る", entry["qa"]["status"] == "failed" and entry["stop_reason"] == "ブラウザ再起動失敗",
+          f"{entry['stop_reason']}")
+
+    # 12) --headless 強制でログインが必要 → ウィンドウを出さず失敗扱い
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=True, duration=60.0, headless=True, login_first=True)
+        a = mk_args(d); a.headless = True
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), a, sess, threading.Event())
+    check("--headless 強制: 起き直さず failed（プレーヤー到達失敗）", sess.relaunches == [] and entry["qa"]["status"] == "failed"
+          and entry["stop_reason"] == "プレーヤー到達失敗", f"{sess.relaunches} {entry['stop_reason']}")
+
+    # 13) ログイン済み（ヘッドレスのまま到達）→ 起き直し無し
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=2, continuous=True, headless=True)
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), mk_args(d), sess, threading.Event())
+    check("ログイン済み: ヘッドレスのまま起き直さず ok", sess.relaunches == [] and entry["qa"]["status"] == "ok")
+
+    # 14) --speed 2: 32kHz でキャプチャし、再生速度 2 を設定・維持する
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=2, continuous=True, capture_result="echo")
+        a = mk_args(d); a.speed = 2.0
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), a, sess, threading.Event())
+    check("speed=2: AudioContext に 32000 Hz を要求", sess.capture_sr_requested == 32000, f"{sess.capture_sr_requested}")
+    check("speed=2: playbackRate=2 を設定し、poll ごとに維持する", sess.rates and all(r == 2.0 for r in sess.rates) and len(sess.rates) >= 3,
+          f"rates={sess.rates and sess.rates[:5]}")
+    check("speed=2: 完走して ok・entry.speed=2", entry["qa"]["status"] == "ok" and entry.get("speed") == 2.0, f"{entry['qa']['status']}")
+    first_rate = sess.calls.index("rate") if "rate" in sess.calls else -1
+    check("speed=2: play 直後（最初の状態確認より前）に rate を設定する（先頭セグメントが 1x で取られない）",
+          first_rate >= 0 and sess.calls[first_rate - 1] == "play", f"{sess.calls[:6]}")
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=2, continuous=True, capture_result="echo")
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), mk_args(d), sess, threading.Event())
+    check("speed=1: playbackRate は触らない", not sess.rates, f"{sess.rates}")
+
+    # 15) speed=2 を要求したが AudioContext が 16kHz しか受けない → failed（速度違いの音声を偽成功にしない）
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=True, duration=60.0, capture_result="capturing sr=16000 state=running")
+        a = mk_args(d); a.speed = 2.0
+        entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), a, sess, threading.Event())
+    check("speed=2 でレート不一致 → failed", entry["qa"]["status"] == "failed" and "サンプルレート" in entry["stop_reason"])
+    try:
+        with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._print_progress"):
+            a = mk_args(d); a.speed = 5.0
+            _process_one_url_page(sess.player_url, 0, 1, mk_tr(), a, _FakeSession(capture_result="echo"), threading.Event())
+        check("speed=5 は範囲外で拒否", False)
+    except ValueError:
+        check("speed=5 は範囲外で拒否", True)
+
     # 10) AudioContext が 16kHz を拒否 → 偽成功にせず failed
     with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
          patch("main._print_progress"):
@@ -2235,6 +2412,30 @@ def test_page_engine_live() -> None:
             check("E2E: qa.status=ok・video_seconds=8.0", entry["qa"]["status"] == "ok" and entry["qa"]["video_seconds"] == 8.0,
                   f"{entry['qa']['status']} {entry['qa']['video_seconds']}")
             check("E2E: 届いた音声秒数が動画長に近い", 6.0 <= entry["audio_seconds_received"] <= 20.0, f"{entry['audio_seconds_received']}")
+            took_1x = entry["elapsed_seconds"]
+
+            # 2 倍速: 同じ動画を speed=2 で。所要が短く、音声は 440Hz のまま（ピッチ補正なしの早回しを 32kHz→16kHz 相当で戻す）
+            segs: list = []
+            tr2 = MagicMock()
+            def fake2(data, time_offset=0.0):
+                segs.append(data.copy())
+                return [TranscriptSegment(text=f"二倍速 {time_offset:.0f} 秒", start=time_offset, end=time_offset + 1, segment_id=0)]
+            tr2.transcribe.side_effect = fake2
+            args2 = argparse.Namespace(**{**vars(args), "speed": 2.0})
+            with patch("main._prompt_rename", side_effect=lambda p: p), patch("main._print_progress"):
+                entry2 = _process_one_url_page(url, 1, 2, tr2, args2, session, threading.Event())
+            check("E2E 2x: 完走して ok", entry2["qa"]["status"] == "ok" and entry2["played"] is True, f"{entry2['qa']}")
+            check("E2E 2x: 所要時間が 1x の 3/4 未満", entry2["elapsed_seconds"] < 0.75 * took_1x, f"2x={entry2['elapsed_seconds']}s 1x={took_1x}s")
+            check("E2E 2x: 届いた音声はコンテンツ秒で動画長相当（1x のまま 32kHz なら約 16 秒になる）",
+                  6.0 <= entry2.get("audio_seconds_received", -1) <= 11.0, f"{entry2.get('audio_seconds_received')}")
+            if segs:
+                seg = segs[0]
+                spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+                freqs = np.fft.rfftfreq(len(seg), 1 / 16000)
+                peak = float(freqs[int(np.argmax(spec[1:])) + 1])
+                check("E2E 2x: 主周波数が 440Hz のまま（速度・ピッチが元に戻っている）", 420 <= peak <= 460, f"peak={peak:.0f}Hz")
+            else:
+                check("E2E 2x: セグメントが届いた", False)
         finally:
             session.close()
             srv.shutdown()
@@ -2414,6 +2615,9 @@ def test_browser_session_thread_boundary() -> None:
         s._call(lambda: time.sleep(0.3), timeout=0.05); check("timeout 超過 → TimeoutError", False)
     except TimeoutError:
         check("timeout 超過 → TimeoutError", True)
+    s.set_chunk_sink(lambda b: None)
+    s.relaunch(headless=True, timeout=5)
+    check("relaunch: headless を切り替えて再起動し sink を維持", s.headless is True and s._sink is not None and s._call(lambda: 7) == 7)
     s.close()
     check("close() 後は _thread が None", s._thread is None)
 
@@ -2439,9 +2643,11 @@ def test_run_page_engine_branch() -> None:
             rc = run(build_parser().parse_args(argv))
         return rc, sess, BS, rb
 
-    rc, sess, BS, rb = go(["--moodle-url", "https://m.example.com/mod/scorm/player.php?a=1", "--profile-dir", "/tmp/prof", "--headless"])
+    rc, sess, BS, rb = go(["--moodle-url", "https://m.example.com/mod/scorm/player.php?a=1", "--profile-dir", "/tmp/prof"])
     check("--moodle-url がフル URL なら 1 本のバッチに昇格", rb.called and rb.call_args.args[0] == ["https://m.example.com/mod/scorm/player.php?a=1"])
-    check("profile_dir / headless が BrowserSession に渡る", BS.call_args.kwargs["profile_dir"] == Path("/tmp/prof") and BS.call_args.kwargs["headless"] is True)
+    check("profile_dir が渡り、既定は非表示（headless=True）", BS.call_args.kwargs["profile_dir"] == Path("/tmp/prof") and BS.call_args.kwargs["headless"] is True)
+    rc, sess, BS, rb = go(["--urls", "https://m.example.com/x?a=1", "--show-browser"])
+    check("--show-browser で常にウィンドウ付き（headless=False）", BS.call_args.kwargs["headless"] is False)
     check("正常終了で session.close()", sess.close.called and rc == 0)
 
     rc, sess, BS, rb = go(["--moodle-url", "example.com"])
@@ -2452,6 +2658,8 @@ def test_run_page_engine_branch() -> None:
 
     rc, sess, BS, rb = go(["--urls", "https://m.example.com/x?a=1", "https://m.example.com/x?a=2"], batch_rc=2)
     check("バッチの rc をそのまま返し、close する", rc == 2 and sess.close.called)
+    rc, sess, BS, rb = go(["--urls", "https://m.example.com/x?a=1", "--speed", "5"])
+    check("--speed 5 は run() で rc=1・ブラウザを起こさない", rc == 1 and not BS.called)
 
 
 def test_monitor_total_guard() -> None:

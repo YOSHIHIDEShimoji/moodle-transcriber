@@ -2675,6 +2675,158 @@ def test_monitor_total_guard() -> None:
             m.poll(silent=False)
     check("取得失敗後も total=262 を保持", m.total == 262.0, f"{m.total}")
 
+
+def test_fix_transcript() -> None:
+    """#38: 校正スクリプト。消してはいけない行を消さない・誤置換しない側を重点的に拘束する。"""
+    print("\n[47] fix_transcript 校正")
+    import json, subprocess as _sp, tempfile
+    from fix_transcript import fix_lines, load_glossary, GlossaryError
+
+    SCRIPT = str(Path(__file__).resolve().parent / "fix_transcript.py")
+    REPO = str(Path(__file__).resolve().parent)
+    T = lambda s, text: f"[00:00:{s:02d}] {text}\n"
+
+    def body(out):
+        return [l for l in out if l.startswith("[")]
+
+    # ── 1) 幻覚行・指定行は完全一致だけ ──
+    lines = [T(0, "ご視聴ありがとうございました。"), T(1, "今日はここまでです。お疲れ様でした。"),
+             T(2, "お疲れ様でした"), T(3, "字幕の設定はこちら"), T(4, "チャンネル登録の話ではありません"),
+             T(5, "俺"), T(6, "俺はこう考える"), T(7, "はい")]
+    out, ch = fix_lines(lines, {}, {"俺"})
+    b = body(out)
+    check("幻覚: 定型句だけの行（句読点違い含む）は消す",
+          T(0, "ご視聴ありがとうございました。") not in out and T(2, "お疲れ様でした") not in out)
+    check("幻覚: 定型句を含む本物の文は残す（部分一致で消さない）",
+          all(x in out for x in (T(1, "今日はここまでです。お疲れ様でした。"), T(3, "字幕の設定はこちら"),
+                                 T(4, "チャンネル登録の話ではありません"))))
+    check("指定行: 完全一致だけ消し、その語を含む文は残す", T(5, "俺") not in out and T(6, "俺はこう考える") in out)
+    check("変更ログは削除した 3 行だけ（行番号・ルール）",
+          [(c["line"], c["rule"]) for c in ch] == [(1, "幻覚行削除"), (3, "幻覚行削除"), (6, "指定行削除")], f"{ch}")
+    check("幻覚かつ指定に該当しても記録は 1 件", len(fix_lines([T(0, "お疲れ様でした")], {}, {"お疲れ様でした"})[1]) == 1)
+
+    # ── 2) 境界重複: 8 文字の境界・隣接・先頭一致・向き ──
+    o7, c7 = fix_lines([T(0, "いちにさんしごろ"[:7]), T(1, "いちにさんしごろくなな")], {}, set())
+    o8, c8 = fix_lines([T(0, "いちにさんしごろ"), T(1, "いちにさんしごろくなな")], {}, set())
+    check("境界重複: 7 文字の先頭断片は消さない", len(body(o7)) == 2 and not c7)
+    check("境界重複: 8 文字の先頭断片は消す", body(o8) == [T(1, "いちにさんしごろくなな")] and c8[0]["line"] == 1)
+    check("境界重複: 短い相槌は消さない", len(body(fix_lines([T(0, "はい"), T(1, "はいそれでは始めます")], {}, set())[0])) == 2)
+    oi, _ = fix_lines([T(0, "環境リモートセンシング"), T(1, "これは環境リモートセンシングの応用です")], {}, set())
+    check("境界重複: 途中に含まれるだけ（先頭一致でない）なら両方残す", len(body(oi)) == 2)
+    oi2, ci2 = fix_lines([T(0, "次は環境リモートセンシングの応用です"), T(1, "環境リモートセンシング")], {}, set())
+    check("境界重複: 長→短でも途中に含まれるだけなら両方残す（ログ空）", len(body(oi2)) == 2 and not ci2, f"{ci2}")
+    on, _ = fix_lines([T(0, "以上ガイダンスの説明は終わり"), T(1, "全く別の話題です"), T(2, "以上ガイダンスの説明は終わりました次へ")], {}, set())
+    check("境界重複: 間に別の行を挟むと発火しない", len(body(on)) == 3)
+    orv, crv = fix_lines([T(0, "以上ガイダンスの説明は終わりました次へ"), T(1, "以上ガイダンスの説明は終わり")], {}, set())
+    check("境界重複: 長い→短いの順なら短い方（後）を消し、長い行は全文残す",
+          body(orv) == [T(0, "以上ガイダンスの説明は終わりました次へ")] and crv[0]["line"] == 2, f"{crv}")
+    o3, c3 = fix_lines([T(0, "今日は講義の説明をします"), T(1, "今日は講義の説明を"), T(2, "今日は講義の説明を始めます")], {}, set())
+    check("境界重複: 3 行連鎖でも 1 行の削除は 1 件だけ記録（二重記録しない）",
+          len(c3) == len({c["line"] for c in c3}) and len(c3) == 3 - len(body(o3)), f"{c3} {body(o3)}")
+    check("境界重複: 正規化して比較（句読点違いも重複）",
+          len(body(fix_lines([T(0, "以上、ガイダンスの説明は"), T(1, "以上ガイダンスの説明は終わります")], {}, set())[0])) == 1)
+    ohal, _ = fix_lines([T(0, "以上ガイダンスの説明は終わり"), T(1, "ご視聴ありがとうございました"), T(2, "以上ガイダンスの説明は終わりました")], {}, set())
+    check("境界重複: 間の幻覚行が消えた後は隣接扱い", body(ohal) == [T(2, "以上ガイダンスの説明は終わりました")])
+
+    # ── 3) 辞書置換: 長い語優先・連鎖しない・複数出現・タイムスタンプ不可侵 ──
+    for g_order, label in (({"きかん": "機関", "きかんちゅう": "期間中"}, "短い語を先に記載"),
+                           ({"きかんちゅう": "期間中", "きかん": "機関"}, "長い語を先に記載")):
+        out, _ = fix_lines([T(0, "きかんちゅうに提出")], g_order, set())
+        check(f"置換: 同じ位置から始まる語は長い方を優先（{label}）", out == [T(0, "期間中に提出")], f"{out}")
+    for g_bad, label in (({"寒卓地": "干拓地", "拓地": "X"}, "置換結果に別の誤語が現れる（連鎖）"),
+                         ({"環境": "観光", "観光": "環境"}, "入れ替え辞書（往復）")):
+        try:
+            fix_lines([T(0, "寒卓地です環境と観光")], g_bad, set())
+            check(f"置換: {label} は黙って置換せず GlossaryError", False)
+        except GlossaryError:
+            check(f"置換: {label} は黙って置換せず GlossaryError", True)
+    out, ch = fix_lines([T(0, "寒卓地と寒卓地")], {"寒卓地": "干拓地"}, set())
+    check("置換: 同じ誤りが 1 行に 2 回でも全部直し、ログは 1 件（after が置換後）",
+          out == [T(0, "干拓地と干拓地")] and len(ch) == 1 and ch[0]["after"] == "干拓地と干拓地" and ch[0]["before"] == "寒卓地と寒卓地")
+    out, _ = fix_lines([T(5, "00:00:05 の話")], {"00:00:0": "XX"}, set())
+    check("置換: タイムスタンプ部分には及ばない", out == ["[00:00:05] XX5 の話\n"], f"{out}")
+
+    # ── 4) ヘッダ・非本文行は不可侵 ──
+    hdr = ["# 寒卓地の講義\n", "# 寒卓地の講義の続きです\n", "# 俺\n", "\n", "# ご視聴ありがとうございました\n", T(0, "本文")]
+    out, ch = fix_lines(hdr, {"寒卓地": "干拓地"}, {"俺"})
+    check("ヘッダ行は辞書語・指定語・定型句・先頭一致があっても 1 文字も変えず、ログにも載らない", out == hdr and not ch, f"{out} {ch}")
+    srt = ["1\n", "00:00:05,000 --> 00:00:08,000\n", "ご視聴ありがとうございました\n", "\n"]
+    check("SRT 形式の行は本文扱いしない（触らない）", fix_lines(srt, {"00:00": "X"}, set())[0] == srt)
+
+    # ── 5) 辞書の検証（黙って捨てない） ──
+    for bad, why in (({"": "X"}, "空の誤語"), ({" ": ""}, "空白だけの誤語"), ({"千葉大": "千葉大学"}, "正が誤を含む"),
+                     ({"寒卓地": "干拓地", "拓地": "X"}, "誤が別項目の正に含まれる（連鎖）"),
+                     ({"環境": "観光", "観光": "環境"}, "入れ替え辞書（往復）"),
+                     ({"a": 1}, "値が文字列でない"), (["x"], "配列"),
+                     ({"__delete__": "音楽"}, "__delete__ が文字列"), ({"__delete__": [""]}, "__delete__ に空")):
+        try:
+            load_glossary(bad); check(f"辞書エラー: {why}", False)
+        except GlossaryError:
+            check(f"辞書エラー: {why}", True)
+    try:
+        fix_lines([T(0, "寒卓地です")], {"寒卓": "干拓", "拓地": "X"}, set())
+        check("置換結果と後ろの文字にまたがる一致（再適用で変わる）→ GlossaryError", False)
+    except GlossaryError:
+        check("置換結果と後ろの文字にまたがる一致（再適用で変わる）→ GlossaryError", True)
+    out, ch = fix_lines([T(0, "お疲れ様でした"), T(1, "同じ行です。同じ行です"), T(2, "同じ行です。同じ行です")], {}, {"お疲れ様でした"})
+    check("幻覚かつ指定の行は『幻覚行削除』として 1 件", ch[0]["rule"] == "幻覚行削除" and ch[0]["line"] == 1)
+    g, dl = load_glossary({"寒卓地": "干拓地", "同じ": "同じ", "__delete__": ["俺 "]})
+    check("辞書: 同値の項目は無視・__delete__ は前後空白を除いて集合に", g == {"寒卓地": "干拓地"} and dl == {"俺"})
+
+    # ── 6) CLI ──
+    src = ["# 講義X\n", "\n", T(0, "寒卓地の話です"), T(1, "俺"), T(2, "ご視聴ありがとうございました")]
+    expect = ["# 講義X\n", "\n", T(0, "干拓地の話です")]
+    with tempfile.TemporaryDirectory() as d:
+        dd = Path(d)
+        a = dd / "a.txt"; a.write_text(T(0, "変更の無いファイル"), encoding="utf-8")
+        f = dd / "b.txt"; f.write_text("".join(src), encoding="utf-8")
+        cp = dd / "course-page.txt"; cp_text = "# URL: x\n第3回 レポート課題\n第3回 レポート課題の提出について\n寒卓地\n"
+        cp.write_text(cp_text, encoding="utf-8")
+        gp = dd / "g.json"; gp.write_text(json.dumps({"寒卓地": "干拓地", "__delete__": ["俺"]}, ensure_ascii=False), encoding="utf-8")
+        files = [str(cp), str(a), str(f)]   # 実際の glob 順と同じく course-page.txt を先頭に
+
+        r = _sp.run([sys.executable, SCRIPT, "--dry-run", "--glossary", str(gp), *files], capture_output=True, text=True, cwd=REPO)
+        check("dry-run: rc=0 で、適用と同じ変更行を表示", r.returncode == 0 and "- L3 [用語置換] 寒卓地の話です → 干拓地の話です" in r.stdout
+              and "- L4 [指定行削除] 俺 → （削除）" in r.stdout and "- L5 [幻覚行削除]" in r.stdout, r.stdout[-400:] + r.stderr[-200:])
+        check("dry-run: ファイル・raw/・校正ログ.md を作らない/変えない",
+              f.read_text(encoding="utf-8") == "".join(src) and not (dd / "raw").exists() and not (dd / "校正ログ.md").exists())
+
+        r = _sp.run([sys.executable, SCRIPT, "--glossary", str(gp), *files], capture_output=True, text=True, cwd=REPO)
+        check("適用: rc=0・1 本目に変更が無くても 2 本目を処理し件数とファイル数が合う",
+              r.returncode == 0 and "変更 3 件 / 2 ファイル（スキップ 1）" in r.stdout, r.stdout[-300:] + r.stderr[-200:])
+        check("適用: 本文が期待どおり（JSON の __delete__ 経路を含む）", f.read_text(encoding="utf-8") == "".join(expect),
+              repr(f.read_text(encoding="utf-8")))
+        check("適用: 先頭の course-page.txt をスキップした後も後続を処理し、触らない",
+              cp.read_text(encoding="utf-8") == cp_text and "スキップ（[hh:mm:ss] 形式の本文行なし）: course-page.txt" in r.stdout)
+        check("適用: 原本を raw/ に退避", (dd / "raw" / "b.txt").read_text(encoding="utf-8") == "".join(src))
+        log = (dd / "校正ログ.md").read_text(encoding="utf-8")
+        check("適用: 校正ログの箇条書きに各変更が載る",
+              "- L3 [用語置換] 寒卓地の話です → 干拓地の話です" in log and "- L4 [指定行削除] 俺 → （削除）" in log
+              and "### b.txt（3 件）" in log)
+
+        # 語を足した辞書で再適用（変更が出る）→ raw は最初の原本のまま
+        gp.write_text(json.dumps({"寒卓地": "干拓地", "話です": "内容です", "__delete__": ["俺"]}, ensure_ascii=False), encoding="utf-8")
+        r = _sp.run([sys.executable, SCRIPT, "--glossary", str(gp), *files], capture_output=True, text=True, cwd=REPO)
+        check("再適用: 変更が出る辞書でも raw/ は最初の原本を保つ",
+              "変更 1 件" in r.stdout and (dd / "raw" / "b.txt").read_text(encoding="utf-8") == "".join(src), r.stdout[-200:])
+        r = _sp.run([sys.executable, SCRIPT, "--glossary", str(gp), *files], capture_output=True, text=True, cwd=REPO)
+        check("再々適用: 変更 0 件（冪等）", "変更 0 件" in r.stdout, r.stdout[-120:])
+
+        bad = dd / "bad.json"; bad.write_text(json.dumps({"千葉大": "千葉大学"}, ensure_ascii=False), encoding="utf-8")
+        before = f.read_text(encoding="utf-8")
+        r = _sp.run([sys.executable, SCRIPT, "--glossary", str(bad), str(f)], capture_output=True, text=True, cwd=REPO)
+        check("不正な辞書: rc=2・何も書き換えない", r.returncode == 2 and "辞書エラー" in r.stderr and f.read_text(encoding="utf-8") == before)
+        broken = dd / "broken.json"; broken.write_text("{not json", encoding="utf-8")
+        r = _sp.run([sys.executable, SCRIPT, "--glossary", str(broken), str(f)], capture_output=True, text=True, cwd=REPO)
+        check("壊れた JSON: rc=2（トレースバックにしない）", r.returncode == 2 and "Traceback" not in r.stderr, r.stderr[-200:])
+        # 2 本目で再適用時の不整合（またがり一致）→ 1 本目も書き換えない（事前検査）
+        x1 = dd / "x1.txt"; x1.write_text(T(0, "寒卓の件"), encoding="utf-8")
+        x2 = dd / "x2.txt"; x2.write_text(T(0, "寒卓地です"), encoding="utf-8")
+        gx = dd / "gx.json"; gx.write_text(json.dumps({"寒卓": "干拓", "拓地": "X"}, ensure_ascii=False), encoding="utf-8")
+        r = _sp.run([sys.executable, SCRIPT, "--glossary", str(gx), str(x1), str(x2)], capture_output=True, text=True, cwd=REPO)
+        check("事前検査: 2 本目で辞書エラーなら rc=2 で 1 本目も書き換えない",
+              r.returncode == 2 and x1.read_text(encoding="utf-8") == T(0, "寒卓の件"), r.stderr[-200:])
+
 if __name__ == "__main__":
     print("=" * 55)
     print("moodle-transcriber 自動テスト")
@@ -2726,6 +2878,7 @@ if __name__ == "__main__":
     test_browser_session_thread_boundary()
     test_run_page_engine_branch()
     test_monitor_total_guard()
+    test_fix_transcript()
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

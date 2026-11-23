@@ -85,6 +85,27 @@ cd ~/my-projects/moodle-transcriber && python .claude/skills/moodle-transcribe/s
 - `warn`: 本文を開いて判断する。「字/分が少ない」は無音の多い動画でも出る。「同一文の連発」は逆相音声か BGM のみ区間の幻覚。本文が講義として読めれば採用し、警告内容を報告に書く。
 - `ok` でも先頭と末尾を数行ずつ読む。英語の歌詞・「ご視聴ありがとうございました」の連発・無関係な内容が無いか。
 
+## 4.5 校正（誤字・変な行を直す）
+
+本文を読んで、固有名詞・専門用語の誤変換と、雑音の行を直す。**判断のいる言い換えや要約はしない**（原文を保つ）。
+
+1. 全本文を読み、誤変換を `out/YYYYMMDD/glossary.json` に `{"誤": "正"}` で書く。文脈で確信が持てるものだけ
+   （講師名・組織名・地名・専門用語。例: 「一位と申します」→「市井と申します」、「寒卓地」→「干拓地」）。
+   短すぎる語は誤置換の元なので、前後を含めた語句で書く。**正が誤を含む項目（「千葉大」→「千葉大学」）は再適用で増殖するため拒否される**。
+   雑音だけの行（例「俺」「音楽」）は `"__delete__": [...]` に本文完全一致で列挙（その語を含む文は消えない）。
+2. まず `--dry-run` で全変更を確認し、意図しない置換が無ければ適用する:
+
+```bash
+cd ~/my-projects/moodle-transcriber && python fix_transcript.py --dry-run --glossary out/YYYYMMDD/glossary.json out/YYYYMMDD/*.txt
+cd ~/my-projects/moodle-transcriber && python fix_transcript.py --glossary out/YYYYMMDD/glossary.json out/YYYYMMDD/*.txt
+```
+
+- 定型句だけの行（「ご視聴ありがとうございました」等、完全一致のみ）と、隣り合う行の境界重複は辞書なしでも自動で消える。
+- 対象は `[hh:mm:ss]` 付きの本文行だけ。`course-page.txt` など本文行の無いファイルは自動でスキップされる。
+- 原本は `out/YYYYMMDD/raw/` に退避され（最初の原本を保ち、再適用で上書きしない）、変更は `校正ログ.md` に残る。
+  同じ辞書での再適用は変更 0 件。辞書が不正なら rc=2 で何も書き換えない。
+- 報告では修正件数と主な置換を書く。確信が持てず直さなかった箇所があれば、それも書く。
+
 ## 5. 講義まとめと課題
 
 **まとめファイル**: `out/YYYYMMDD/講義まとめ.md`。構成は固定:
@@ -117,7 +138,7 @@ cd ~/my-projects/moodle-transcriber && python tab_text.py --engine page --url "h
 
 ## 6. ダウンロードフォルダへコピー
 
-`~/Downloads/moodle-transcriber-YYYYMMDD/` を作り、**この実行の**成果物だけをコピーする（run-summary.json の `output` に列挙された本文 + 講義まとめ.md + 課題.md + run-summary.json）。同日の別実行の古いファイルは混ぜない。`rm` は使わない。
+`~/Downloads/moodle-transcriber-YYYYMMDD/` を作り、**この実行の**成果物だけをコピーする（run-summary.json の `output` に列挙された本文 + 講義まとめ.md + 課題.md + run-summary.json）。校正した場合は、コピーは校正の後に行い、`校正ログ.md` も一緒にコピーする。同日の別実行の古いファイルは混ぜない。`rm` は使わない。
 
 ```bash
 cd ~/my-projects/moodle-transcriber && python .claude/skills/moodle-transcribe/copy_to_downloads.py out/YYYYMMDD/run-summary.json

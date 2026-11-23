@@ -1,7 +1,13 @@
 # moodle-transcriber 使い方
 
 Moodleの講義動画音声をオンデバイス（ローカルAI）で自動文字起こしするツール。
-サーバーへの送信なし、Moodle側のログに影響なし。動画はダウンロードしない。
+動画はダウンロードしない。ブラウザで普通に再生し、その音声をローカルの Whisper で文字にする。
+音声や文字起こし結果を外部サーバーへ送ることはない。
+
+**Moodle 側の記録について**: 普通に視聴するのと同じく、Moodle には閲覧と視聴状況が記録される。
+これは意図した動作で、視聴が評価に入る科目でも視聴済みになる（「視聴状況を保存」「活動から抜ける」も自動で押す）。
+動画ファイルを直接ダウンロードする方式（yt-dlp 等）は採らない。視聴状況が付かないうえ、
+多くの大学の利用規約で禁止されているため。
 
 ## 2 つのエンジン
 
@@ -134,32 +140,28 @@ Python 側はそのために次を出す:
 - `--json-summary PATH` でサマリーの出力先を変えられる。
 - `python tab_text.py --pattern course/view.php` で Chrome の該当タブ本文を読む（読み取り専用。
   コースページの課題確認に使う）。
-- 起動時に Spotify / Music が再生中なら警告する（録音は全システム音声のため）。
+- 起動時に Spotify / Music が再生中なら警告する（blackhole エンジンのみ関係。録音が全システム音声のため）。
+- `python fix_transcript.py --glossary glossary.json out/YYYYMMDD/*.txt` で文字起こしを校正する。
+  定型句だけの幻覚行と境界の重複行を消し、辞書（`{"誤": "正"}`）で固有名詞の誤変換を直す。
+  原本は `raw/` に退避し、変更は `校正ログ.md` に残す。`--dry-run` で変更内容だけ確認できる。
 
 ---
 
 ## 基本的な使い方
 
-### Chrome で Moodle を開いてから起動
-
 ```bash
-python main.py --moodle-url "your-univ.moodle.com"
+python main.py --urls "https://moodle.gs.chiba-u.jp/moodle/mod/scorm/player.php?a=188066&currentorg&scoid=376188"
 ```
 
-- `--moodle-url` を指定すると `--keep-active chrome` が自動的に有効になる
-- スクリプト起動直後に Moodle タブに JS を注入 → 別タブ・別アプリに移動しても動画が止まらない
-- `your-univ.moodle.com` はMoodleのドメインの一部を指定（例: `moodle`, `lms.example.ac.jp`）
-- 音声は Multi-Output Device に切り替わる（スピーカーから聞こえる + BlackHole で録音）
-- Ctrl+C で終了 → スピーカー出力が元のデバイスに自動復元
+- URL は SCORM プレーヤーの URL（`mod/scorm/player.php?a=...`）を渡す。複数可（次節）。
+- 専用 Chrome（別プロファイル）が非表示で起動し、動画を再生しながら文字起こしする。あなたの Chrome には触らない。
+- 初回やセッション切れのときだけ専用 Chrome のウィンドウが出るので、そこで Moodle にログインする。
+- 講義の音はスピーカーから鳴らない（ページ内で音声を取っているため）。Spotify や YouTube を聞いていても混ざらない。
+- `--speed 2` で 2 倍速（所要時間が半分）。
+- Ctrl+C で途中停止すると、その時点までの文字起こしは保存される。
 
-### 音量について
-
-| 状態 | スピーカー | BlackHole録音 |
-|---|---|---|
-| 音量 100% | 聞こえる | される |
-| **音量 0（キーボード）** | **無音** | **される（継続）** |
-
-音量 0 にしても BlackHole への信号は維持されるため、**無音で文字起こしを続けられる**。
+従来方式（`--engine blackhole`。あなたの Chrome を操作し、BlackHole でシステム音声を録る）の使い方は
+末尾の「従来方式（blackhole エンジン）」を参照。
 
 ---
 
@@ -227,19 +229,20 @@ https://moodle.example.com/mod/scorm/player.php?id=103
 
 ### 自動処理の流れ
 
-1. URL1 を Chrome で開く（自動遷移）
-2. 動画を自動再生
+1. 専用 Chrome で URL1 を開く（ログイン画面ならウィンドウを出してログインを待つ）
+2. 動画を自動再生し、実際に再生が始まったことを確認する
 3. 文字起こし開始
 4. 60秒ごとに「視聴状況を保存」ボタンを自動クリック
-5. 視聴状況が 100% になったら「視聴状況を保存」→「活動から抜ける」を自動クリック
-6. ファイルを保存してターミナルに完了サマリーを表示
+5. 動画の終了を検出したら「視聴状況を保存」→「活動から抜ける」を自動クリック
+   （再生できなかった動画では押さない）
+6. ファイルを保存し、自己診断（ok / warn / failed）とともに完了サマリーを表示
 7. 5秒待機 → 次の URL へ
-8. 全 URL 完了後に macOS 通知
+8. 全 URL 完了後に macOS 通知。結果は `out/YYYYMMDD/run-summary.json` にも残る
 
 ### 注意事項
 
-- **Chrome が前面にある状態で実行すること**（URL 遷移が Chrome のアクティブタブに対して行われる）
-- 動画再生中はブラウザを別タブに移動しても問題ない（JS 注入で視聴状況は維持される）
+- 実行中もあなたの Chrome や他のアプリは普通に使ってよい
+- 専用 Chrome のウィンドウが出ている間（ログイン時）は、閉じたり最小化したりしない
 - Ctrl+C で途中停止した場合、その時点までの文字起こしは保存される
 ```
 out/20260501/
@@ -337,12 +340,14 @@ out/20260501/
 
 ---
 
-## keep-alive の仕組み
+## keep-alive の仕組み（blackhole エンジンのみ）
 
-`--moodle-url` を指定すると（`--keep-active` 省略時は `chrome` が自動選択）：
+page エンジンでは専用 Chrome の全フレームに同等の処理を起動時に組み込むので、この節は従来方式の説明。
+
+`--engine blackhole --moodle-url` を指定すると（`--keep-active` 省略時は `chrome` が自動選択）：
 
 1. スクリプト起動直後にAppleScriptでChromeの全タブを検索
-2. URLが `--moodle-url` のパターンに一致するタブを見つける
+2. URLが `--moodle-url` のパターンに一致するタブを見つけ、以後はタブ id で追跡する
 3. そのタブに JavaScript を注入：
 
 ```javascript
@@ -355,7 +360,8 @@ Moodle の動画プレーヤーは `visibilityState` を読んで一時停止す
 
 **SCORMプレーヤーについて**: Moodleの動画は `<iframe>` 内で再生されることがある（SCORM形式）。タイトル取得時は `window.top.document` でメインフレームを参照するため、iframe内で実行されても正しく取得できる。
 
-**サーバーへの影響**: この変更はブラウザのDOM内のみ。サーバーへのリクエストは一切発生しない。
+**サーバーへの影響**: visibilityState の上書き自体はブラウザ内の処理で、追加のリクエストは発生しない。
+動画の再生と視聴状況の保存は通常の視聴と同じく Moodle に記録される。
 
 ---
 
@@ -395,46 +401,40 @@ brew install switchaudio-osx
 `--moodle-url "moodle.gs.chiba-u.jp"` のようにドメインの一部を指定する。
 
 ### Windows での使い方
-```bash
-pip install pyaudiowpatch
-python main.py  # WASAPI Loopback を自動検出
-```
-> Windows では `--keep-active` は動作しません（macOS 専用機能）。
+
+未検証。page エンジンは Playwright と Chrome で動くので仕組み上は動く可能性があるが、
+文字起こしは faster-whisper 経路になり、実機で確かめていない。
+従来方式の WASAPI Loopback 経路（`pip install pyaudiowpatch`）も同様に未検証。
 
 ---
 
 ## モデルサイズの選び方
 
-| モデル | 精度 | 30秒の処理時間 (M4) | 用途 |
-|---|---|---|---|
-| `tiny` | 低 | ~0.5秒 | テスト用 |
-| `small` | 中 | ~2秒 | 動作確認 |
-| `medium` | 高 | ~4秒 | 一般講義 |
-| `large-v3` | 最高 | ~6秒 | **専門用語が多い講義（推奨）** |
+| モデル | 精度 | 用途 |
+|---|---|---|
+| `tiny` | 低 | 動作確認のみ |
+| `small` | 中 | 急ぐとき |
+| `medium` | 高 | 一般講義 |
+| `large-v3` | 最高 | 遅い |
+| `large-v3-turbo` | 最高に近い | **既定・推奨**。2 倍速でも処理が追いつく |
 
-初回は `--model small` でテスト → 問題なければ `large-v3`（初回DL約1.5GB）。
+モデルファイルは `whisper.cpp/models/ggml-<model>.bin`（large 系は約 1.5GB）。
 
 ---
 
-## GUI モード（PySide6）
+## 従来方式（blackhole エンジン）
 
-ターミナルを使わずにウィンドウから操作したい場合は `main_gui.py` を起動する。
+`--engine blackhole` で、あなたの Chrome を AppleScript で操作し、BlackHole でシステム音声を録る従来方式に戻せる。
+講義の音をスピーカーで聞きながら回したいときに使う。初期セットアップの 1〜3 が必要。
 
 ```bash
-pip install pyside6
-python main_gui.py
+python main.py --engine blackhole --moodle-url "moodle.gs.chiba-u.jp"
 ```
 
-**Basic セクション** — 最低限の必須項目:
-- Moodle URL リスト（複数追加可、`＋ 追加` / `− 削除`）
-- Model / Format / Output Folder
-- ▶ Start / ■ Stop
+- Chrome で Moodle の動画ページを開いてから起動する。Chrome が前面に出て、タブの操作とクリックが行われる。
+- 音声出力は複数出力装置に切り替わり、終了時に元へ戻る。
+- **全システム音声を録るので、実行中は Spotify などの音を止める**（歌詞が文字起こしに混ざる）。
+- 音量を 0 にしても BlackHole への信号は維持されるので、無音で文字起こしを続けられる。
+- 本人の Chrome に「表示 → 開発/管理 → Apple Events からの JavaScript を許可」が必要。
 
-**Advanced セクション**（折りたたみ） — 複雑な設定:
-- 文字起こしせず Chrome 自動再生のみ (`--no-transcribe`)
-- 文字起こしテキストを Log に表示 (`--print-transcript`)
-- タイムスタンプ付与 (`--timestamps`)
-- Browser / Save interval / Keep interval
-- 音声ルーティング自動切替の無効化 / Restore to
-
-進捗バーとログがウィンドウに表示され、視聴完了時はファイル名リネームダイアログがポップアップする（CLI と同等）。Stop ボタンは内部で SIGINT を送るため、CLI の Ctrl+C と同じ流れで安全停止する。
+GUI 版（`main_gui.py`）は削除済み（コミット 496f627）。

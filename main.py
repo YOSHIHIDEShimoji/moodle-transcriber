@@ -470,7 +470,11 @@ class PlaybackMonitor:
         # ── フォールバック3: 視聴状況 100% が継続 ─────────────────────
         # 未開始判定より前に置く: 既視聴 (pct=100) の URL で再生が始まらなくても
         # 4 分待たずに終了する。視聴済みなので保存/離脱クリックは有効 (played=True)。
-        if pct >= 100:
+        # ただし currentTime が進んでいる間は数えない: 既視聴の動画を撮り直すと pct は最初から 100 なので、
+        # 再生中でも約 1.5 分で打ち切っていた（2026-10-24 実測: cur=84/262 で停止）。
+        # 再生中の既視聴動画は ended / 末尾到達 / 巻き戻し / 停滞で止まる。cur が取れないときは従来どおり数える。
+        advancing = cur >= 0 and self._last_cur >= 0 and cur - self._last_cur >= 0.5
+        if pct >= 100 and not advancing:
             self._pct100 += 1
             if self._pct100 >= self.PCT100_POLLS:
                 self.played = True
@@ -828,6 +832,31 @@ class _SessionProbe:
         return st.current_time, st.duration
 
 
+def _page_rewind_to_start(session: "BrowserSession", threshold: float) -> bool:
+    """currentTime が threshold 秒を超えていたら 0 に戻す。戻したら True。
+
+    SCORM プレーヤーは視聴済みの動画を前回の位置（ブックマーク）から再開するため、そのまま撮ると冒頭が欠ける
+    （2026-11-24 実測: ガイダンス動画が約 90 秒から始まり、冒頭 1 分半が文字起こしに無かった）。
+    戻せなくても処理は続ける（欠けるのは冒頭だけで、全体を失敗にするほどではない）。"""
+    try:
+        st = session.state()
+        if not st.found or st.current_time <= threshold:
+            return False
+        got = session.seek(0.0)
+        if got < 0 or got > threshold:
+            # プレーヤーがシークを拒否した（seekable でない等）。冒頭は欠けるが処理は続ける
+            logger.warning("resume position %.1fs detected but seek to start was refused (now %.1fs)",
+                           st.current_time, got)
+            print(_YLW(f"  前回の視聴位置 {st.current_time:.0f} 秒から再開され、冒頭に戻せませんでした（冒頭が欠けます）"))
+            return False
+        logger.info("resume position %.1fs detected → seek to start (now %.1fs)", st.current_time, got)
+        print(f"  {_DIM(f'前回の視聴位置 {st.current_time:.0f} 秒から再開されたため、冒頭に戻しました')}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("seek to start failed: %s", e)
+        return False
+
+
 def _page_play_with_retry(session: "BrowserSession", attempts: int = 5, settle: float = 0.5,
                           rate: float = 1.0) -> bool:
     """video.play() を呼び、実際に paused=false になったことを確認する。rate != 1 なら再生速度も設定する。"""
@@ -1010,7 +1039,13 @@ def _process_one_url_page(
 
     speed_note = f"  {_DIM(f'再生速度 {speed:g}x')}" if speed != 1.0 else ""
     print(f"\n{_BGRN('▶  文字起こし開始')}  {_DIM('Ctrl+C で全停止')}{speed_note}\n")
+    _page_rewind_to_start(session, threshold=1.0)
     _page_play_with_retry(session, rate=speed)
+    # プレーヤーが play() を契機にブックマーク位置へ飛ばす構成もあるので、再生開始後にもう一度確かめる。
+    # 再生確認までの数秒ぶん（最大 約 3 秒 × 速度）は進んでいて当然なので、閾値はそれより十分大きくする
+    _page_rewind_to_start(session, threshold=15.0)
+    # 既知の制限: 最初の play() が失敗し、後で PlaybackMonitor の retrigger で再生が始まった場合は再確認しない。
+    # また play() を契機に飛ぶプレーヤーでは、戻すまでの数秒ぶん（最大 約 3 秒 × 速度）の音声が冒頭に混ざる
 
     probe = _SessionProbe(session)
     monitor = PlaybackMonitor(url, "page", retrigger=lambda: _page_play_with_retry(session, rate=speed), probe=probe,

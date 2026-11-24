@@ -100,6 +100,17 @@ SET_RATE_JS_TEMPLATE = r"""
 })()
 """
 
+# 再生位置を移す。SCORM プレーヤーは視聴済みの動画を前回の位置から再開する（2026-11-24 実測: 約 90 秒から再開し
+# 冒頭が欠けた）ので、撮り始める前に頭へ戻すのに使う。移した後の currentTime を返す（video が無ければ -1）。
+SEEK_JS_TEMPLATE = r"""
+(() => {
+  const v = document.querySelector('video');
+  if (!v) return -1;
+  try { v.currentTime = %s; } catch (e) {}
+  return v.currentTime;
+})()
+"""
+
 STOP_CAPTURE_JS = r"""
 (() => {
   const c = window.__mtCap;
@@ -422,6 +433,15 @@ class BrowserSession:
             if f is None:
                 return -1.0
             return float(f.evaluate(SET_RATE_JS_TEMPLATE % repr(float(rate))))
+        return self._call(_fn, timeout=20)
+
+    def seek(self, t: float) -> float:
+        """video.currentTime を t 秒に移し、移した後の値を返す（video が無ければ -1）。"""
+        def _fn():
+            f = self._find_video_frame()
+            if f is None:
+                return -1.0
+            return float(f.evaluate(SEEK_JS_TEMPLATE % repr(float(t))))
         return self._call(_fn, timeout=20)
 
     def stop_capture(self) -> str:

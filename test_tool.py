@@ -1243,6 +1243,99 @@ def test_playback_monitor_not_started() -> None:
     check("pct=100 & 未開始 → 視聴状況 100% で終了", rp[-1][0] and "100%" in rp[-1][1], f"last={rp[-1]}")
     check("pct=100 終了は played=True（保存/離脱を押す）", mp.played is True)
 
+    test_pct100_rewatch()
+
+
+def _poll_seq(pcts, times, retrigger=None, near_end_margin=30.0):
+    """pct / (cur, total) の系列を順に返すモックで PlaybackMonitor を回し、(monitor, 各 poll の結果) を返す。"""
+    from unittest.mock import patch
+    from main import PlaybackMonitor
+    pi, ti = iter(pcts), iter(times)
+    with patch("main.get_viewing_percentage", side_effect=lambda *a, **k: next(pi)), \
+         patch("main.get_video_ended", return_value=False), \
+         patch("main.get_video_time", side_effect=lambda *a, **k: next(ti)), \
+         patch("main._print_progress"):
+        m = PlaybackMonitor(1, "chrome", retrigger=retrigger, near_end_margin=near_end_margin)
+        res = [m.poll(silent=False, elapsed=i * 30.0) for i in range(len(times))]
+    return m, res
+
+
+def test_pct100_rewatch() -> None:
+    """既視聴（pct が最初から 100）の動画を撮り直しても、再生が進んでいる間は「視聴状況 100%」で止めない。"""
+    print("\n[10b] 既視聴動画の撮り直し: 再生中は pct=100 で止めない")
+    T = 262.0
+
+    # 2026-10-24 の実ログを再現（2 倍速・cur=34→59→84 で「視聴状況 100%」停止していた）
+    m, r = _poll_seq([100] * 3, [(34.2, T), (59.2, T), (84.3, T)])
+    check("実ログ再現: 再生中の 3 poll では止まらない", not any(s for s, _ in r), f"{r}")
+
+    # 冒頭から末尾まで再生 → 100% では止まらず、末尾到達系の理由で止まる
+    curs = [25.0 * i + 1 for i in range(11)] + [T, T]          # 1, 26, ..., 251, 262, 262
+    m, r = _poll_seq([100] * len(curs), [(c, T) for c in curs])
+    stops = [(i, why) for i, (s, why) in enumerate(r) if s]
+    check("全編再生: 末尾手前では止まらない", stops and stops[0][0] >= 11, f"{stops}")
+    check("全編再生: 止まる理由は 100% ではなく末尾到達", stops and "100%" not in stops[0][1], f"{stops}")
+
+    # 末尾で巻き戻る SCORM でも巻き戻し検出で止まる（100% 判定に食われない）
+    curs = [25.0 * i + 1 for i in range(11)] + [0.0]
+    m, r = _poll_seq([100] * len(curs), [(c, T) for c in curs])
+    check("全編再生→巻き戻し: 巻き戻し検出で終了", r[-1][0] and "巻き戻し" in r[-1][1], f"{r[-1]}")
+    check("全編再生→巻き戻し: それまでは止まらない", not any(s for s, _ in r[:-1]), f"{r}")
+
+    # 再生中に止まった（cur が動かない）→ 従来どおり PCT100_POLLS 回で 100% 終了
+    from main import PlaybackMonitor
+    n = PlaybackMonitor.PCT100_POLLS
+    curs = [1.0, 26.0, 51.0] + [51.0] * n
+    m, r = _poll_seq([100] * len(curs), [(c, T) for c in curs])
+    check("再生中に停止: 停止後 PCT100_POLLS 回で 100% 終了", r[-1][0] and "100%" in r[-1][1], f"{r}")
+    check("再生中に停止: その 1 回前では止まらない", not r[-2][0], f"{r}")
+
+    # 停止→再開→停止: 再開でカウンタがリセットされる
+    curs = [1.0, 26.0, 26.0, 26.0, 51.0, 51.0, 51.0]
+    m, r = _poll_seq([100] * len(curs), [(c, T) for c in curs])
+    check("停止中のカウントは再生再開でリセット", not any(s for s, _ in r[:6]), f"{r}")
+    curs = [1.0, 26.0, 26.0, 26.0, 51.0] + [51.0] * n
+    m, r = _poll_seq([100] * len(curs), [(c, T) for c in curs])
+    check("停止→再開→停止: 2 回目の停止後 PCT100_POLLS 回で 100% 終了", r[-1][0] and "100%" in r[-1][1], f"{r}")
+
+    # 既視聴で再生開始が遅れる（未開始分岐 → retrigger → 再生開始）。未開始分岐でも _last_cur を更新していないと
+    # 再生が始まった直後の poll が「進んでいない」と誤判定され、また約 1.5 分で打ち切られる
+    from unittest.mock import MagicMock
+    rt = MagicMock()
+    curs = [0.0, 0.0, 20.0, 45.0, 70.0, 95.0, 120.0]
+    m, r = _poll_seq([100] * len(curs), [(c, T) for c in curs], retrigger=rt)
+    check("開始遅れ→再生開始: 100% では止まらない", not any(s for s, _ in r), f"{r}")
+    check("開始遅れ→再生開始: retrigger が 1 回呼ばれた", rt.call_count == 1, f"calls={rt.call_count}")
+    check("開始遅れ→再生開始: played=True", m.played is True)
+
+    # 途中で頭に戻して（シークバック）再生を続ける → 100% では止まらない
+    curs = [60.0, 120.0, 0.0, 25.0, 50.0, 75.0]
+    m, r = _poll_seq([100] * len(curs), [(c, T) for c in curs])
+    check("途中シークバック後も再生が進めば止まらない", not any(s for s, _ in r), f"{r}")
+
+    # 既定 margin（5 秒）で末尾手前から 0 に戻る → 巻き戻し検出は効かないが、0 のまま動かないので 100% で止まる
+    curs = [200.0, 225.0, 251.0] + [0.0] * n
+    m, r = _poll_seq([100] * len(curs), [(c, T) for c in curs], near_end_margin=5.0)
+    stops = [(i, w) for i, (s, w) in enumerate(r) if s]
+    check("既定 margin・末尾手前で 0 に戻る → 0 のまま PCT100_POLLS 回で終了",
+          stops and stops[0][0] == len(curs) - 1, f"{stops}")
+
+    # 0.5 秒未満の動きは「進んでいない」扱い（境界）
+    curs = [10.0, 10.4, 10.8, 11.2]
+    m, r = _poll_seq([100] * len(curs), [(c, T) for c in curs])
+    check("0.4 秒ずつの動きは停止扱い → 100% で終了", any(s and "100%" in w for s, w in r), f"{r}")
+    curs = [10.0, 10.5, 11.0, 11.5, 12.0]
+    m, r = _poll_seq([100] * len(curs), [(c, T) for c in curs])
+    check("0.5 秒ずつ進めば 100% では止まらない", not any(s and "100%" in w for s, w in r), f"{r}")
+
+    # cur が取れない（SCORM の iframe で video に届かない）→ pct だけが頼り。従来どおり止まる
+    m, r = _poll_seq([100] * n, [(-1.0, -1.0)] * n)
+    check("cur 不明 & pct=100 → PCT100_POLLS 回で終了", r[-1][0] and "100%" in r[-1][1], f"{r}")
+
+    # 「連続」の意味: pct が途中で 100 未満 / 取得不能になったらカウントはリセット
+    m, r = _poll_seq([100, -1, 100, -1, 100], [(-1.0, -1.0)] * 5)
+    check("cur 不明 & pct が 100 と -1 を往復 → 100% では止まらない", not any(s for s, _ in r), f"{r}")
+
 
 def test_downmix_antiphase() -> None:
     """#19: 逆相ステレオ (L ≈ -R) を平均で打ち消さない。"""
@@ -1948,7 +2041,8 @@ class _FakeSession:
     def __init__(self, play_ok=True, player_url="https://m.example.com/mod/scorm/player.php?a=1",
                  duration=60.0, stop_event=None, interrupt_after=None, feed_seconds=0.0,
                  has_video=True, capture_result="capturing sr=16000 state=running", lazy_chunks=None,
-                 continuous=False, max_state_calls=400, headless=False, login_first=False):
+                 continuous=False, max_state_calls=400, headless=False, login_first=False,
+                 start_at=0.0, seek_error=None, jump_on_play=None, seek_ignored=False):
         """continuous=True: 本番の ScriptProcessor と同じく、state() が呼ばれるたびに 1 秒ぶんの
         チャンクを**動画終了後も無音で**供給し続ける（タイムアウト経路が救済できない条件）。
         max_state_calls: 止まらない回帰をハングでなく例外（赤）にする上限。"""
@@ -1969,7 +2063,11 @@ class _FakeSession:
         self.duration = duration
         self.calls: list[str] = []
         self.sink = None
-        self.cur = 0.0
+        self.cur = float(start_at)          # 視聴済み動画の再開位置（SCORM ブックマーク）を模す
+        self._seek_error = seek_error
+        self._jump_on_play = jump_on_play   # play() を契機にブックマーク位置へ飛ぶプレーヤーを模す
+        self._seek_ignored = seek_ignored   # シークを受け付けないプレーヤーを模す
+        self.seeks: list[float] = []
         self.playing = False
         self.state_calls = 0
         self._stop_event = stop_event
@@ -2049,8 +2147,18 @@ class _FakeSession:
         return rate
     playback_rate = 1.0
     def stop_capture(self): self.calls.append("stop_capture"); return "stopped"
+    def seek(self, t):
+        self.calls.append("seek")
+        if self._seek_error:
+            raise RuntimeError(self._seek_error)
+        self.seeks.append(t)
+        if not self._seek_ignored:
+            self.cur = float(t)
+        return self.cur
     def play(self):
         self.calls.append("play")
+        if self._jump_on_play is not None:
+            self.cur, self._jump_on_play = float(self._jump_on_play), None
         if self.play_ok:
             self.playing = True
             return "playing"
@@ -2078,6 +2186,70 @@ class _FakeSession:
     def viewing_percentage(self): return int(self.cur / self.duration * 100) if self.playing else 0
     def click_save(self): self.calls.append("save"); return True
     def click_exit(self): self.calls.append("exit"); return True
+
+
+def test_page_resume_rewind() -> None:
+    """視聴済み動画を SCORM が前回位置から再開しても、撮り始める前に頭へ戻す（冒頭欠け防止）。"""
+    print("\n[40b] page エンジン: 前回の視聴位置から再開されたら冒頭に戻す")
+    import argparse, threading, tempfile
+    from unittest.mock import MagicMock, patch
+    from main import _process_one_url_page
+    from transcriber import TranscriptSegment
+
+    def run(**kw):
+        with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), \
+             patch("main._prompt_rename", side_effect=lambda p: p), patch("main._print_progress"):
+            args = argparse.Namespace(verbose=False, timestamps=False, format="txt", output=d, model="tiny",
+                                      language="ja", segment_duration=1.0, overlap=0.0, save_interval=0,
+                                      login_timeout=5.0, player_marker="player.php", headless=False, speed=1.0)
+            tr = MagicMock()
+            tr.transcribe.side_effect = lambda data, time_offset=0.0: [
+                TranscriptSegment(text=f"本文 {time_offset:.0f} 秒の説明です。", start=time_offset, end=time_offset + 1, segment_id=0)]
+            sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=0, continuous=True, **kw)
+            entry = _process_one_url_page(sess.player_url, 0, 1, tr, args, sess, threading.Event())
+            lines = entry["qa"]["lines"]
+        return sess, entry, lines
+
+    base_sess, base_entry, base_lines = run()
+    check("再開位置 0: seek しない", "seek" not in base_sess.calls, f"{base_sess.calls}")
+
+    sess, entry, lines = run(start_at=40.0)
+    first_play = sess.calls.index("play")
+    check("再開位置 40 秒: play より前に 0 へ seek", "seek" in sess.calls[:first_play] and sess.seeks == [0.0],
+          f"calls={sess.calls[:8]} seeks={sess.seeks}")
+    check("再開位置 40 秒: 冒頭から撮れて本文行数が位置 0 のときと同じ", lines == base_lines and lines > 0,
+          f"lines={lines} base={base_lines}")
+    check("再開位置 40 秒: video.ended で正常終了", entry["played"] and entry["stop_reason"] == "video.ended",
+          f"{entry['stop_reason']}")
+
+    sess, entry, lines = run(jump_on_play=40.0)
+    first_play = sess.calls.index("play")
+    check("play() でブックマークへ飛ぶ: 再生開始後に 0 へ seek", "seek" in sess.calls[first_play:] and sess.seeks == [0.0],
+          f"calls={sess.calls[:10]} seeks={sess.seeks}")
+    check("play() でブックマークへ飛ぶ: 冒頭から撮れる", lines >= base_lines - 1 and lines > 0, f"lines={lines} base={base_lines}")
+
+    sess, entry, lines = run(start_at=40.0, seek_error="boom")
+    check("seek が失敗しても処理は続行し正常終了", entry["played"] and entry["stop_reason"] == "video.ended",
+          f"{entry['stop_reason']}")
+
+    # 閾値の境界: 再生前は 1 秒超で戻す。短いブックマーク（5 秒）でも戻す
+    sess, _, _ = run(start_at=5.0)
+    check("再開位置 5 秒: 戻す", sess.seeks == [0.0], f"seeks={sess.seeks}")
+    sess, _, _ = run(start_at=1.0)
+    check("再開位置 1.0 秒（境界）: 戻さない", "seek" not in sess.calls, f"calls={sess.calls[:8]}")
+    # 再生後は 15 秒超で戻す（再生確認までの数秒は進んで当然なので戻さない）
+    sess, _, _ = run(jump_on_play=17.0)
+    check("play() で 17 秒へ飛ぶ: 戻す", sess.seeks == [0.0], f"seeks={sess.seeks}")
+    sess, _, _ = run(jump_on_play=12.0)
+    check("play() で 12 秒へ飛ぶ: 戻さない（閾値 15 秒以下）", "seek" not in sess.calls, f"calls={sess.calls[:10]}")
+
+    # シークを拒否されたら警告を出す（成功扱いにしない）
+    import main as _main
+    with patch.object(_main.logger, "warning") as warn:
+        sess, entry, _ = run(start_at=40.0, seek_ignored=True)
+    msgs = [c.args[0] for c in warn.call_args_list]
+    check("シーク拒否: refused の警告を出す", any("refused" in m for m in msgs), f"{msgs}")
+    check("シーク拒否: 処理は続行し正常終了", entry["played"] and entry["stop_reason"] == "video.ended", f"{entry['stop_reason']}")
 
 
 def test_process_one_url_page() -> None:
@@ -2114,7 +2286,9 @@ def test_process_one_url_page() -> None:
     check("再生済み: played=True・stop_reason=video.ended", entry["played"] is True and entry["stop_reason"] == "video.ended",
           f"{entry['played']} {entry['stop_reason']}")
     check("再生済み: 通常経路（セグメント到着ごとの poll）で止まる。タイムアウト経路は使わず 3 秒以内",
-          took < 3.0 and polls_main and all(s is False for s in polls_main), f"took={took:.1f}s polls={polls_main[:6]}")
+          # silent=None がタイムアウト経路。再生前の状態確認で偽セッションが無音チャンクを 1 つ流すので True は許す
+          took < 3.0 and polls_main and all(s is not None for s in polls_main) and polls_main.count(True) <= 1,
+          f"took={took:.1f}s polls={polls_main[:6]}")
     check("再生済み: qa.status=ok", entry["qa"]["status"] == "ok", f"{entry['qa']}")
     check("再生済み: 本文が数えられる（qa.lines>0）", entry["qa"]["lines"] > 0, f"lines={entry['qa']['lines']}")
     check("再生済み: タイトルは | の前", entry["title"] == "講義X")
@@ -2379,6 +2553,15 @@ def test_page_engine_live() -> None:
             '<div id="region-main"><a href="#" onclick="window.__exited=true;return false;">活動から抜ける</a></div>'
             '<iframe src="inner.html" width="640" height="300"></iframe></body></html>', encoding="utf-8")
         (fx / "inner.html").write_text('<!doctype html><html><body><video src="tone.wav"></video></body></html>')
+        # SCORM のブックマーク再開を模す: メタデータ読込時に 4 秒地点へ飛ぶ（1 回だけ）
+        (fx / "player_bm.html").write_text(
+            (fx / "player.html").read_text(encoding="utf-8").replace("inner.html", "inner_bm.html"), encoding="utf-8")
+        (fx / "inner_bm.html").write_text(
+            '<!doctype html><html><body><video id="v" preload="auto" src="tone.wav"></video><script>'
+            'const v=document.getElementById("v");let done=false;'
+            'const bm=()=>{if(!done){done=true;v.currentTime=4;}};'
+            'if(v.readyState>=1)bm();else v.addEventListener("loadedmetadata",bm);'
+            '</script></body></html>')
         srv = ThreadingHTTPServer(("127.0.0.1", 0), partial(SimpleHTTPRequestHandler, directory=str(fx)))
         th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
         port = srv.server_address[1]
@@ -2436,6 +2619,26 @@ def test_page_engine_live() -> None:
                 check("E2E 2x: 主周波数が 440Hz のまま（速度・ピッチが元に戻っている）", 420 <= peak <= 460, f"peak={peak:.0f}Hz")
             else:
                 check("E2E 2x: セグメントが届いた", False)
+
+            # 実 BrowserSession.seek: ブックマーク（4 秒）から再開するプレーヤーでも冒頭から撮れる
+            url_bm = f"http://127.0.0.1:{port}/player_bm.html"
+            tr3 = MagicMock()
+            tr3.transcribe.side_effect = lambda data, time_offset=0.0: [
+                TranscriptSegment(text=f"再開 {time_offset:.0f} 秒", start=time_offset, end=time_offset + 1, segment_id=0)]
+            args3 = argparse.Namespace(**{**vars(args), "player_marker": "player_bm.html"})
+            with patch("main._prompt_rename", side_effect=lambda p: p), patch("main._print_progress"):
+                entry3 = _process_one_url_page(url_bm, 2, 3, tr3, args3, session, threading.Event())
+            check("E2E ブックマーク再開: 冒頭に戻して動画長ぶんの音声が届く（戻さないと約 4 秒）",
+                  entry3["played"] is True and entry3.get("audio_seconds_received", -1) >= 6.5,
+                  f"audio={entry3.get('audio_seconds_received')} stop={entry3['stop_reason']}")
+            # seek() 単体: 実際に位置が動き、移した後の値を返す
+            session.goto(url_bm)
+            session.wait_for_player(contains="player_bm.html", timeout=20, login_timeout=0)
+            got5 = session.seek(5.0); cur5 = session.state().current_time
+            got0 = session.seek(0.0); cur0 = session.state().current_time
+            check("E2E seek(5): 返り値と currentTime が約 5 秒", abs(got5 - 5.0) < 0.5 and abs(cur5 - 5.0) < 0.5,
+                  f"got={got5} cur={cur5}")
+            check("E2E seek(0): 返り値と currentTime が約 0 秒", abs(got0) < 0.5 and abs(cur0) < 0.5, f"got={got0} cur={cur0}")
         finally:
             session.close()
             srv.shutdown()
@@ -2872,6 +3075,7 @@ if __name__ == "__main__":
     test_warn_other_audio_apps()
     test_page_capture()
     test_process_one_url_page()
+    test_page_resume_rewind()
     test_page_engine_live()
     test_course_page_dump_and_page_batch()
     test_wait_for_player_unit()

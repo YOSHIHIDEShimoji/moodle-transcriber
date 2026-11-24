@@ -128,7 +128,7 @@ export WHISPER_CPP_DIR=/path/to/whisper.cpp
 
 Claude Code に Moodle の URL（複数可）を貼って「文字起こしして」と言うだけで、
 `.claude/skills/moodle-transcribe/SKILL.md` の手順で事前確認 → 起動 → 監視 → 検品 →
-失敗分の再実行 → 講義まとめ（課題があれば課題ファイル）→ `~/Downloads` へコピーまで進む。
+失敗分の再実行 → 講義まとめ（課題があれば課題ファイル）まで進み、最後に `~/Downloads` へコピーするか聞く。
 Python 本体は変わらない。Claude は「起動・監視・検品・要約」だけを担当する。
 
 Python 側はそのために次を出す:

@@ -1,6 +1,6 @@
 ---
 name: moodle-transcribe
-description: Moodle の講義動画 URL（1 本〜複数）を受け取り、moodle-transcriber（python main.py）を起動・監視・検品し、失敗した動画は原因を切り分けて再実行、最後に講義まとめ（と課題があれば課題ファイル）を出力ディレクトリと ~/Downloads に書き出す。「文字起こしして」「この講義まとめて」「Moodle の動画を文字に」と moodle.gs.chiba-u.jp 等の URL が渡されたら使う。動画のダウンロードはしない。専用 Chrome（別プロファイル）で再生しページ内で音声を取るので、本人の Chrome や Spotify には影響しない。
+description: Moodle の講義動画 URL（1 本〜複数）を受け取り、moodle-transcriber（python main.py）を起動・監視・検品し、失敗した動画は原因を切り分けて再実行、最後に講義まとめ（と課題があれば課題ファイル）を出力ディレクトリに書き出す（~/Downloads へのコピーは終了時に本人に聞いてから）。「文字起こしして」「この講義まとめて」「Moodle の動画を文字に」と moodle.gs.chiba-u.jp 等の URL が渡されたら使う。動画のダウンロードはしない。専用 Chrome（別プロファイル）で再生しページ内で音声を取るので、本人の Chrome や Spotify には影響しない。
 ---
 
 # moodle-transcribe
@@ -136,17 +136,19 @@ cd ~/my-projects/moodle-transcriber && python tab_text.py --engine page --url "h
 （専用プロファイルの Chrome を一時的に起こして読む。本人の Chrome には触らない。従来方式なら `--pattern course/view.php` で本人の Chrome のタブを読む。）
 課題.md には、課題名・内容・提出先・締切（分かる範囲）・根拠の引用元（動画名 + タイムスタンプ or コースページ）を書く。推測で締切を埋めない。
 
-## 6. ダウンロードフォルダへコピー
+## 6. 報告
 
-`~/Downloads/moodle-transcriber-YYYYMMDD/` を作り、**この実行の**成果物だけをコピーする（run-summary.json の `output` に列挙された本文 + 講義まとめ.md + 課題.md + run-summary.json）。校正した場合は、コピーは校正の後に行い、`校正ログ.md` も一緒にコピーする。同日の別実行の古いファイルは混ぜない。`rm` は使わない。
+1 メッセージで: 表（動画 / 状態 / 行数 / 保存先）、まとめと課題ファイルのパス、課題の有無と根拠、warn の中身、再実行したものとその結果。失敗が残っていれば原因の仮説と次の一手。
+
+報告の最後に **「~/Downloads にもコピーしますか？」と聞く**。自動ではコピーしない（毎回は要らない、と本人が指定）。
+
+## 7. ダウンロードフォルダへコピー（本人が「はい」と答えたときだけ）
+
+`~/Downloads/moodle-transcriber-YYYYMMDD/` を作り、**この実行の**成果物だけをコピーする（run-summary.json の `output` に列挙された本文 + 講義まとめ.md + 課題.md + run-summary.json、校正した場合は `校正ログ.md` も）。同日の別実行の古いファイルは混ぜない。`rm` は使わない。コピー後、コピー先のパスを伝える。
 
 ```bash
 cd ~/my-projects/moodle-transcriber && python .claude/skills/moodle-transcribe/copy_to_downloads.py out/YYYYMMDD/run-summary.json
 ```
-
-## 7. 報告
-
-1 メッセージで: 表（動画 / 状態 / 行数 / 保存先）、まとめと課題ファイルのパス（リポジトリ内と Downloads の両方）、課題の有無と根拠、warn の中身、再実行したものとその結果。失敗が残っていれば原因の仮説と次の一手。
 
 ## 守ること
 

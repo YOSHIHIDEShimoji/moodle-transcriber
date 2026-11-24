@@ -37,14 +37,27 @@ cd ~/my-projects/moodle-transcriber && python .claude/skills/moodle-transcribe/p
 URL を scratchpad の `urls.txt` に書き、**アプリ内ターミナル（run_in_terminal）で起動**する（本人が見え、Ctrl+C で止められる。サンドボックス外なので権限で詰まらない）。ターミナルが無ければ Bash の run_in_background。
 
 ```bash
-cd ~/my-projects/moodle-transcriber && python -u main.py --url-file <scratchpad>/urls.txt < /dev/null
+cd ~/my-projects/moodle-transcriber && caffeinate -i -s -d python -u main.py --url-file <scratchpad>/urls.txt < /dev/null
 ```
+
+- **必ず `caffeinate -i -s -d` で包む**（処理中に Mac がスリープすると再生も録音も止まる）。起動後に
+  `pmset -g assertions | grep -A1 "(caffeinate)"` で、その PID が PreventSystemSleep / PreventUserIdleSystemSleep を出していることを確かめて報告する。
+  `-s` は電源接続時だけ効く。蓋を閉じるとスリープしうるので、本人に「電源につないで蓋は開けたまま」と伝える。
 
 - `< /dev/null` でリネームプロンプト（60 秒待ち）をスキップする。
 - 出力は `out/YYYYMMDD/<講義タイトル>.txt`、サマリーは同ディレクトリの `run-summary.json`（URL ごとに書き直される）。
 - 既定モデルは `large-v3-turbo`。急ぐ・試すときだけ `--model small`。
-- `--speed 2` で 2 倍速（所要時間半分・音質同等）。本人が速度を指定したらそれを使う。指定が無ければ既定の 1 倍。
-  2 倍で回したときは検品で「字/分」と本文の崩れを 1 倍のときと比べ、視聴状況が 100% になったかを course-page / ログで確認して報告に書く。
+- **既定は 2 倍速**（所要時間半分・音質同等。2026-11-24 から）。本人が速度を指定したらそれを使う（等速は `--speed 1`、上限 3）。
+- **2 倍速の安全手順（等速に戻す判断）**: 早回しの視聴を Moodle が記録しないと成績に響くので、次の順で進める。
+  1. **最初の 1 本だけ**を先に 2 倍で回す（`urls.txt` に 1 行だけ書いて起動）。
+  2. 終わったら視聴状況を確かめる。まず run-summary の `viewing_pct`（保存直後に読んだ値。show_summary に出る）。
+     不明（-1）なら専用 Chrome で開き直して読む:
+     `python tab_text.py --engine page --url "<その URL>" --pct` → `視聴状況: 100%` ならよい。
+  3. **100% なら**残りを 2 倍で回す。**100% 未満なら**その 1 本と残り全部を `--speed 1` で回し直す（2 倍の失敗ファイルは残して報告に書く）。
+     確かめられない（どちらも不明）ときは本人に聞く。
+  4. 検品（4）で 2 倍の動画に warn / failed が出たら、原因が速度と無関係と言えない限り、**その URL だけ `--speed 1` で撮り直す**
+     （例: 「届いた音声が動画長の半分未満」「字/分が極端に少ない」「n 倍速で視聴状況が XX%」、ログの `playbackRate drifted`）。
+  5. 報告に、使った速度・等速に戻したもの・その理由を書く。
 - **既定は非表示（ヘッドレス）**: 専用 Chrome のウィンドウは普段出ない。
 - **ログイン**: セッションが無い／切れていると、ログに `login required (headless) → relaunch with window` が出て、
   専用ブラウザがウィンドウ付きで起き直り前面に来る。本人に「右上に出た Chrome ウィンドウでログインしてください」と伝え、
@@ -84,6 +97,7 @@ cd ~/my-projects/moodle-transcriber && python .claude/skills/moodle-transcribe/s
 - `failed`: 空・幻覚のみ・未再生・中断。**該当 URL だけ**を新しい `urls.txt` にして 2 を再実行する（同じ出力ディレクトリに `_2` 付きで保存される。元の失敗ファイルは残しておき、報告で明記する）。2 回失敗したら原因切り分けに移り、本人に報告する。
 - `warn`: 本文を開いて判断する。「字/分が少ない」は無音の多い動画でも出る。「同一文の連発」は逆相音声か BGM のみ区間の幻覚。本文が講義として読めれば採用し、警告内容を報告に書く。
 - `ok` でも先頭と末尾を数行ずつ読む。英語の歌詞・「ご視聴ありがとうございました」の連発・無関係な内容が無いか。
+- 2 倍速で回したものは、2 の「2 倍速の安全手順」の 4 に従って等速での撮り直しを判断する。
 
 ## 4.5 校正（誤字・変な行を直す）
 

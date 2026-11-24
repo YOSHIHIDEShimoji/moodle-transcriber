@@ -2,6 +2,7 @@
 
 用途: スキルがコースページ（course/view.php）から課題の有無を読むため。
 例: python tab_text.py --pattern course/view.php
+    python tab_text.py --engine page --url <動画 URL> --pct   # 専用 Chrome でその動画の「視聴状況 XX%」だけ出す
     python tab_text.py --tab-id 2144333200 --max 8000
 """
 
@@ -42,6 +43,11 @@ def _dump_with_page_engine(a) -> int:
             print(f"ページに到達できませんでした: {s.url()}", file=sys.stderr)
             return 2
         s.pump(1500)
+        if a.pct:
+            # 2 倍速の視聴が Moodle に記録されたかの確認用。SCORM の構成でフレームが違うので全フレームを探す
+            pct = s.viewing_percentage()
+            print(f"視聴状況: {pct}%" if pct >= 0 else "視聴状況: 不明（ページに表示が無い）")
+            return 0 if pct >= 0 else 2
         text = s.evaluate(COURSE_PAGE_TEXT_JS) or ""
         print(f"# URL: {s.url()}")
         print(text[: a.max])
@@ -60,6 +66,7 @@ def main() -> int:
                    help="user: 本人の Chrome のタブを読む（既定） / page: 専用プロファイルの Chrome で --url を開いて読む")
     p.add_argument("--url", help="--engine page のとき開く URL（例: コースページ）")
     p.add_argument("--profile-dir", default=None)
+    p.add_argument("--pct", action="store_true", help="--engine page のとき、本文の代わりに「視聴状況 XX%%」だけ出す")
     a = p.parse_args()
     if a.engine == "page":
         return _dump_with_page_engine(a)

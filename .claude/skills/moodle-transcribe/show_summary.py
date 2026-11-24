@@ -16,6 +16,9 @@ def main() -> int:
         print(f"      {e['output']}")
         print(f"      {q['lines']} 行 / {q['chars_per_min']:.0f} 字/分 / 動画 {q['video_seconds']:.0f} 秒 / "
               f"played={e['played']} / 終了: {e['stop_reason'] or '-'}")
+        if "speed" in e:
+            pct = e.get("viewing_pct", -1)
+            print(f"      速度 {e['speed']:g}x / 保存後の視聴状況 {str(pct) + '%' if pct >= 0 else '不明'}")
         for w in q.get("warnings", []):
             print(f"      ⚠ {w}")
     return 0

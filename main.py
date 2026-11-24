@@ -237,9 +237,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="page エンジンでログイン画面に落ちたとき、本人のログインを待つ秒数（既定 600）",
     )
     p.add_argument(
-        "--speed", type=float, default=1.0,
-        help="page エンジンの再生速度（1.0〜3.0）。preservesPitch を切った早回しを 16000×速度 Hz で取り、"
-             "元の速度・ピッチに戻して文字起こしする。Chrome は 4 倍超で音声をミュートするため上限 3",
+        "--speed", type=float, default=2.0,
+        help="page エンジンの再生速度（0.5〜3.0、既定 2）。preservesPitch を切った早回しを 16000×速度 Hz で取り、"
+             "元の速度・ピッチに戻して文字起こしする。Chrome は 4 倍超で音声をミュートするため上限 3。"
+             "等速に戻すときは --speed 1",
     )
     p.add_argument(
         "--player-marker", default="player.php",
@@ -1121,9 +1122,17 @@ def _process_one_url_page(
         capture.stop()
         writer.finalize()
 
+    viewing_pct = -1
     if stop_reason and monitor.played and not stop_event.is_set():
         session.click_save()
         time.sleep(1)
+        # 保存直後の「視聴状況 XX%」。未視聴の動画では再生中は表示されないことが多い（-1）ので保存後に読む。
+        # 早回しで視聴が記録されない Moodle を検出するため（取れなければ -1 のまま）
+        try:
+            viewing_pct = int(session.viewing_percentage())
+        except Exception as e:  # noqa: BLE001
+            logger.debug("viewing_percentage after save: %s", e)
+        logger.info("viewing status after save: %d%%", viewing_pct)
         session.click_exit()
     elif stop_reason and not monitor.played:
         logger.warning("video never played — skipping save/exit clicks")
@@ -1133,6 +1142,12 @@ def _process_one_url_page(
     entry = _entry(page_title, page_url, output_path, texts, stop_reason, monitor.played, monitor.total)
     entry["audio_seconds_received"] = round(capture.seconds_received, 1)
     entry["speed"] = speed
+    entry["viewing_pct"] = viewing_pct
+    if speed > 1.0 and 0 <= viewing_pct < 100:
+        entry["qa"]["warnings"].append(
+            f"{speed:g} 倍速で視聴状況が {viewing_pct}%（早回しの視聴が記録されていない可能性。--speed 1 で撮り直す）")
+        if entry["qa"]["status"] == "ok":
+            entry["qa"]["status"] = "warn"
     if monitor.played and monitor.total > 0 and capture.seconds_received < monitor.total * 0.5:
         entry["qa"]["warnings"].append(
             f"届いた音声が動画長の半分未満: {capture.seconds_received:.0f}s / {monitor.total:.0f}s")

@@ -325,6 +325,8 @@ def test_new_args() -> None:
 
     # --timestamps: デフォルト False
     args = p.parse_args([])
+    check("--speed の既定は 2 倍", args.speed == 2.0, f"{args.speed}")
+    check("--speed 1 で等速に戻せる", p.parse_args(["--speed", "1"]).speed == 1.0)
     check("--timestamps デフォルト False", args.timestamps is False)
     args_ts = p.parse_args(["--timestamps"])
     check("--timestamps 指定で True", args_ts.timestamps is True)
@@ -2042,7 +2044,8 @@ class _FakeSession:
                  duration=60.0, stop_event=None, interrupt_after=None, feed_seconds=0.0,
                  has_video=True, capture_result="capturing sr=16000 state=running", lazy_chunks=None,
                  continuous=False, max_state_calls=400, headless=False, login_first=False,
-                 start_at=0.0, seek_error=None, jump_on_play=None, seek_ignored=False):
+                 start_at=0.0, seek_error=None, jump_on_play=None, seek_ignored=False, pct_after_save=None,
+                 pct_error_after_save=False):
         """continuous=True: 本番の ScriptProcessor と同じく、state() が呼ばれるたびに 1 秒ぶんの
         チャンクを**動画終了後も無音で**供給し続ける（タイムアウト経路が救済できない条件）。
         max_state_calls: 止まらない回帰をハングでなく例外（赤）にする上限。"""
@@ -2067,6 +2070,10 @@ class _FakeSession:
         self._seek_error = seek_error
         self._jump_on_play = jump_on_play   # play() を契機にブックマーク位置へ飛ぶプレーヤーを模す
         self._seek_ignored = seek_ignored   # シークを受け付けないプレーヤーを模す
+        self._pct_after_save = pct_after_save   # 保存後に表示される視聴状況（None なら再生位置から計算）
+        self._pct_error_after_save = pct_error_after_save   # 保存後の読み取りで例外（タイムアウト等）
+        self._saved = False
+        self._exited = False
         self.seeks: list[float] = []
         self.playing = False
         self.state_calls = 0
@@ -2183,9 +2190,44 @@ class _FakeSession:
         return VideoState(found=True, paused=not self.playing or ended, ended=ended,
                           current_time=self.cur, duration=self.duration, capture_count=1, ctx_state="running",
                           playback_rate=self.playback_rate)
-    def viewing_percentage(self): return int(self.cur / self.duration * 100) if self.playing else 0
-    def click_save(self): self.calls.append("save"); return True
-    def click_exit(self): self.calls.append("exit"); return True
+    def viewing_percentage(self):
+        if self._exited:
+            return -1          # 離脱後はコースページに移っていて表示が無い（本番と同じ）
+        if self._saved and self._pct_error_after_save:
+            raise TimeoutError("fake: viewing_percentage timeout")
+        if self._saved and self._pct_after_save is not None:
+            return self._pct_after_save
+        return int(self.cur / self.duration * 100) if self.playing else 0
+    def click_save(self): self.calls.append("save"); self._saved = True; return True
+    def click_exit(self): self.calls.append("exit"); self._exited = True; return True
+
+
+def test_tab_text_pct() -> None:
+    """tab_text.py --engine page --pct: 視聴状況の表示書式と終了コード（スキルが -1 のときの確認に使う）。"""
+    print("\n[40c] tab_text --pct")
+    import argparse, io, contextlib
+    from unittest.mock import patch
+    import tab_text
+
+    class S:
+        def __init__(self, pct): self._pct = pct; self.closed = False
+        def start(self, timeout=90): pass
+        def goto(self, url): return url
+        def wait_for_player(self, **kw): return "https://m.example.com/mod/scorm/player.php?a=1"
+        def pump(self, ms=200): pass
+        def viewing_percentage(self): return self._pct
+        def url(self): return "https://m.example.com/mod/scorm/player.php?a=1"
+        def evaluate(self, js): return "本文"
+        def close(self): self.closed = True
+
+    for pct, rc_want, out_want in ((100, 0, "視聴状況: 100%"), (0, 0, "視聴状況: 0%"), (-1, 2, "視聴状況: 不明")):
+        s = S(pct)
+        a = argparse.Namespace(url="https://m.example.com/mod/scorm/player.php?a=1", profile_dir=None, pct=True, max=100)
+        buf = io.StringIO()
+        with patch("browser.BrowserSession", return_value=s), contextlib.redirect_stdout(buf):
+            rc = tab_text._dump_with_page_engine(a)
+        check(f"--pct {pct}: rc={rc_want}・「{out_want}」", rc == rc_want and out_want in buf.getvalue() and s.closed,
+              f"rc={rc} out={buf.getvalue()!r}")
 
 
 def test_page_resume_rewind() -> None:
@@ -2492,6 +2534,50 @@ def test_process_one_url_page() -> None:
         entry = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), mk_args(d), sess, threading.Event())
     check("speed=1: playbackRate は触らない", not sess.rates, f"{sess.rates}")
 
+    # 14b) 保存後の視聴状況を entry に残し、早回しで 100% にならなければ warn（スキルが --speed 1 で撮り直す合図）
+    def run_pct(speed, pct, **kw):
+        with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+             patch("main._print_progress"):
+            sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=2, continuous=True, capture_result="echo",
+                                pct_after_save=pct, **kw)
+            a = mk_args(d); a.speed = speed
+            e = _process_one_url_page(sess.player_url, 0, 1, mk_tr(), a, sess, threading.Event())
+        return sess, e
+    sess, e = run_pct(2.0, 100)
+    check("speed=2・保存後 100%: viewing_pct=100・ok", e.get("viewing_pct") == 100 and e["qa"]["status"] == "ok",
+          f"{e.get('viewing_pct')} {e['qa']}")
+    sess, e = run_pct(2.0, 50)
+    # 偽セッションは離脱後に -1 を返す。離脱の後に読む退行なら -1 になり、この警告が出ない
+    check("speed=2・保存後 50%: warn で --speed 1 の撮り直しを促す",
+          e["qa"]["status"] == "warn" and any("50%" in w and "--speed 1" in w for w in e["qa"]["warnings"]), f"{e['qa']}")
+    check("speed=2・保存後 50%: 視聴状況は離脱の前に読んでいる（viewing_pct=50）", e.get("viewing_pct") == 50, f"{e.get('viewing_pct')}")
+    sess, e = run_pct(2.0, 99)
+    check("speed=2・保存後 99%（境界）: warn", e["qa"]["status"] == "warn", f"{e['qa']}")
+    sess, e = run_pct(2.0, -1)
+    check("speed=2・視聴状況が取れない (-1): 警告しない（不明はスキル側で確認）", e["qa"]["status"] == "ok" and e["viewing_pct"] == -1,
+          f"{e['qa']}")
+    sess, e = run_pct(2.0, 0)
+    check("speed=2・保存後 0%（記録されない本命ケース）: warn",
+          e["qa"]["status"] == "warn" and any("0%" in w and "--speed 1" in w for w in e["qa"]["warnings"]), f"{e['qa']}")
+    sess, e = run_pct(1.0, 50)
+    check("speed=1・保存後 50%: 速度のせいではないので警告しない", e["qa"]["status"] == "ok", f"{e['qa']}")
+    sess, e = run_pct(0.5, 50)
+    check("speed=0.5・保存後 50%: 早回しではないので警告しない", e["qa"]["status"] == "ok", f"{e['qa']}")
+    # 読み取りが例外（タイムアウト等）でもバッチを止めず、不明 (-1) 扱いで警告しない・離脱は押す
+    sess, e = run_pct(2.0, None, pct_error_after_save=True)
+    check("視聴状況の読み取りが例外: entry が返り viewing_pct=-1・ok・離脱を押す",
+          e.get("viewing_pct") == -1 and e["qa"]["status"] == "ok" and "exit" in sess.calls, f"{e.get('viewing_pct')} {e['qa']} {sess.calls[-3:]}")
+    # 既に failed のものを warn に格下げしない（警告は追記する）
+    with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
+         patch("main._print_progress"):
+        sess = _FakeSession(play_ok=True, duration=60.0, feed_seconds=2, continuous=True, capture_result="echo",
+                            pct_after_save=0)
+        a = mk_args(d); a.speed = 2.0
+        tr_empty = MagicMock(); tr_empty.transcribe.return_value = []      # 本文が 1 行も出ない → failed
+        e = _process_one_url_page(sess.player_url, 0, 1, tr_empty, a, sess, threading.Event())
+    check("failed のまま（warn に格下げしない）・視聴状況の警告は追記", e["qa"]["status"] == "failed"
+          and any("0%" in w for w in e["qa"]["warnings"]), f"{e['qa']}")
+
     # 15) speed=2 を要求したが AudioContext が 16kHz しか受けない → failed（速度違いの音声を偽成功にしない）
     with tempfile.TemporaryDirectory() as d, patch("main.time.sleep"), patch("main._prompt_rename", side_effect=lambda p: p), \
          patch("main._print_progress"):
@@ -2549,8 +2635,11 @@ def test_page_engine_live() -> None:
             w.setnchannels(2); w.setsampwidth(2); w.setframerate(sr); w.writeframes((st * 32767).astype(np.int16).tobytes())
         (fx / "player.html").write_text(
             '<!doctype html><html><head><meta charset="utf-8"><title>テスト講義 | コース | TestMoodle</title></head>'
-            '<body><p>視聴状況 0%</p><div id="save"><input type="button" value="保存" onclick="window.__saved=(window.__saved||0)+1"></div>'
-            '<div id="region-main"><a href="#" onclick="window.__exited=true;return false;">活動から抜ける</a></div>'
+            # 保存で「視聴状況」が 100% に変わる（Moodle の視聴記録を模す）
+            '<body><p id="pct">視聴状況 0%</p><div id="save"><input type="button" value="保存" '
+            'onclick="window.__saved=(window.__saved||0)+1;document.getElementById(\'pct\').textContent=\'視聴状況 100%\'"></div>'
+            # 離脱で「視聴状況」の表示が消える（本番はコースページへ移る）。離脱後に読む退行を E2E でも捕まえる
+            '<div id="region-main"><a href="#" onclick="window.__exited=true;document.getElementById(\'pct\').textContent=\'\';return false;">活動から抜ける</a></div>'
             '<iframe src="inner.html" width="640" height="300"></iframe></body></html>', encoding="utf-8")
         (fx / "inner.html").write_text('<!doctype html><html><body><video src="tone.wav"></video></body></html>')
         # SCORM のブックマーク再開を模す: メタデータ読込時に 4 秒地点へ飛ぶ（1 回だけ）
@@ -2608,6 +2697,7 @@ def test_page_engine_live() -> None:
             with patch("main._prompt_rename", side_effect=lambda p: p), patch("main._print_progress"):
                 entry2 = _process_one_url_page(url, 1, 2, tr2, args2, session, threading.Event())
             check("E2E 2x: 完走して ok", entry2["qa"]["status"] == "ok" and entry2["played"] is True, f"{entry2['qa']}")
+            check("E2E 2x: 保存後の視聴状況をページから読む (100%)", entry2.get("viewing_pct") == 100, f"{entry2.get('viewing_pct')}")
             check("E2E 2x: 所要時間が 1x の 3/4 未満", entry2["elapsed_seconds"] < 0.75 * took_1x, f"2x={entry2['elapsed_seconds']}s 1x={took_1x}s")
             check("E2E 2x: 届いた音声はコンテンツ秒で動画長相当（1x のまま 32kHz なら約 16 秒になる）",
                   6.0 <= entry2.get("audio_seconds_received", -1) <= 11.0, f"{entry2.get('audio_seconds_received')}")
@@ -2634,6 +2724,12 @@ def test_page_engine_live() -> None:
             # seek() 単体: 実際に位置が動き、移した後の値を返す
             session.goto(url_bm)
             session.wait_for_player(contains="player_bm.html", timeout=20, login_timeout=0)
+            # メタデータ読込で 4 秒へ飛ぶスクリプトが走り終わるのを待つ（先に seek すると後から 4 秒に上書きされる）
+            for _ in range(50):
+                st0 = session.state()
+                if st0.found and st0.duration > 0 and abs(st0.current_time - 4.0) < 0.5:
+                    break
+                session.pump(100)
             got5 = session.seek(5.0); cur5 = session.state().current_time
             got0 = session.seek(0.0); cur0 = session.state().current_time
             check("E2E seek(5): 返り値と currentTime が約 5 秒", abs(got5 - 5.0) < 0.5 and abs(cur5 - 5.0) < 0.5,
@@ -3076,6 +3172,7 @@ if __name__ == "__main__":
     test_page_capture()
     test_process_one_url_page()
     test_page_resume_rewind()
+    test_tab_text_pct()
     test_page_engine_live()
     test_course_page_dump_and_page_batch()
     test_wait_for_player_unit()

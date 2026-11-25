@@ -49,12 +49,17 @@ cd ~/my-projects/moodle-transcriber && caffeinate -i -s -d python -u main.py --u
 - 既定モデルは `large-v3-turbo`。急ぐ・試すときだけ `--model small`。
 - **既定は 2 倍速**（所要時間半分・音質同等。2026-11-24 から）。本人が速度を指定したらそれを使う（等速は `--speed 1`、上限 3）。
 - **2 倍速の安全手順（等速に戻す判断）**: 早回しの視聴を Moodle が記録しないと成績に響くので、次の順で進める。
-  1. **最初の 1 本だけ**を先に 2 倍で回す（`urls.txt` に 1 行だけ書いて起動）。
+  **フォルダは分けない**: 確認用の 1 本も残りも同じ `out/YYYYMMDD/` に出す（`first/` 等のサブフォルダは作らない）。
+  1. **最初の 1 本だけ**を先に 2 倍で回す（`urls.txt` に 1 行だけ書いて起動）。このときだけサマリーを別名にする:
+     `-o out/YYYYMMDD --json-summary out/YYYYMMDD/first-run-summary.json`（残りの実行で run-summary.json が上書きされるため）。
   2. 終わったら視聴状況を確かめる。まず run-summary の `viewing_pct`（保存直後に読んだ値。show_summary に出る）。
      不明（-1）なら専用 Chrome で開き直して読む:
      `python tab_text.py --engine page --url "<その URL>" --pct` → `視聴状況: 100%` ならよい。
   3. **100% なら**残りを 2 倍で回す。**100% 未満なら**その 1 本と残り全部を `--speed 1` で回し直す（2 倍の失敗ファイルは残して報告に書く）。
-     確かめられない（どちらも不明）ときは本人に聞く。
+     確かめられない（どちらも不明）ときは本人に聞く。等速の撮り直しは同名ファイルがあるので `<タイトル>_1.txt` になる。
+     残りが終わったら 1 つのサマリーに統合して片付ける（等速で全部回し直した場合は first 側が自動で除外される）:
+     `python .claude/skills/moodle-transcribe/merge_summaries.py out/YYYYMMDD/first-run-summary.json out/YYYYMMDD/run-summary.json`
+     → `trash -v out/YYYYMMDD/first-run-summary.json`。以降の検品・コピーは run-summary.json だけを見る。
   4. 検品（4）で 2 倍の動画に warn / failed が出たら、原因が速度と無関係と言えない限り、**その URL だけ `--speed 1` で撮り直す**
      （例: 「届いた音声が動画長の半分未満」「字/分が極端に少ない」「n 倍速で視聴状況が XX%」、ログの `playbackRate drifted`）。
   5. 報告に、使った速度・等速に戻したもの・その理由を書く。
